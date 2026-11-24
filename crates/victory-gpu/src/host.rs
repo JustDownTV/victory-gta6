@@ -1375,6 +1375,77 @@ fn take_chunk(host: &Host, size: u64) -> Option<Chunk> {
     })
 }
 
+/// The most bytes of upload buffers kept while nothing holds them
+/// (`VICTORY_UPLOAD_POOL_MB`, 256; 0: every upload buffer is made for its
+/// copy or texture and freed with it, as before).
+fn upload_pool_most() -> u64 {
+    static MOST: OnceLock<u64> = OnceLock::new();
+    *MOST.get_or_init(|| {
+        std::env::var("VICTORY_UPLOAD_POOL_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(256) << 20
+    })
+}
+
+/// The size an upload buffer of `size` bytes is made at so that another of
+/// a near size can take it again: 64 KiB at least, else rounded up to a
+/// quarter of the power of two below it (a quarter more bytes at most).
+fn upload_class(size: u64) -> u64 {
+    let size = size.max(64 << 10);
+    let below = 63 - (size - 1).leading_zeros();
+    size.next_multiple_of(1 << (below - 2))
+}
+
+/// The last value signalled on the host fence, read without the
+/// submission lock: a buffer given back to [`SPARE_UPLOADS`] is taken again
+/// only once the card has passed the value signalled when it was given.
+static SIGNALLED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// An upload buffer nothing holds: the buffer, its mapping, its class, and
+/// the host fence value after which the card no longer reads it.
+struct SpareUpload<B = ID3D12Resource> {
+    buffer: B,
+    data: usize,
+    class: u64,
+    after: u64,
+}
+
+/// Upload buffers of lists' copies and of textures' staging that nothing
+/// holds now ([`upload_class`]), and their bytes. A cutscene of the title
+/// copies some 300 of them (110 MB) a frame, and each was made, mapped,
+/// zeroed and freed (run late-again: 49,000 made in 90 s, lists' resets at
+/// 40 to 100 ms a frame against 5 in gameplay).
+static SPARE_UPLOADS: Mutex<(Vec<SpareUpload>, u64)> = Mutex::new((Vec::new(), 0));
+
+/// Takes the last given of `spare` of class `class` the card is done with
+/// (`completed`: the host fence's completed value).
+fn take_spare_upload<B>(spare: &mut (Vec<SpareUpload<B>>, u64), class: u64, completed: u64) -> Option<SpareUpload<B>> {
+    let at = spare.0.iter().rposition(|s| s.class == class && s.after <= completed)?;
+    spare.1 -= class;
+    Some(spare.0.remove(at))
+}
+
+/// Nothing holds an upload buffer of class `class` from
+/// [`Host::pooled_upload`] any more (its lists were reset, its staging
+/// went): kept for the next to ask once the card has run what was sent so
+/// far, or freed past [`upload_pool_most`]. Class 0: freed.
+pub(crate) fn give_upload(buffer: ID3D12Resource, data: *mut u8, class: u64) {
+    if class == 0 {
+        return;
+    }
+    let after = SIGNALLED.load(Ordering::Acquire);
+    let back = {
+        let mut spare = SPARE_UPLOADS.lock().unwrap_or_else(|e| e.into_inner());
+        if spare.1 + class > upload_pool_most() {
+            Some(buffer)
+        } else {
+            spare.1 += class;
+            spare.0.push(SpareUpload { buffer, data: data as usize, class, after });
+            None
+        }
+    };
+    // Freed outside the lock.
+    drop(back);
+}
+
 /// A list is done with `chunks` (it was reset after its submissions ran,
 /// or dropped): kept for the next list, or freed past [`SPARE_MOST`] and
 /// without the pool.
@@ -1678,6 +1749,9 @@ struct Deferred {
     backs: Vec<(ID3D12Resource, usize, [usize; 3])>,
     /// Whether a step zeroes the indirect-work budget.
     budget_zeroed: bool,
+    /// Those of `uploads` taken from the pool ([`Host::pooled_upload`]):
+    /// given back when the list is reset (buffer, mapping, class).
+    pooled: Vec<(ID3D12Resource, usize, u64)>,
 }
 
 impl Deferred {
@@ -1695,6 +1769,10 @@ impl Drop for Deferred {
     fn drop(&mut self) {
         ALIVE[6].fetch_sub(self.uploads.len() as u64, Ordering::Relaxed);
         ALIVE[7].fetch_sub(self.upload_bytes, Ordering::Relaxed);
+        // The list's submissions ran: the next list may take them.
+        for (buffer, data, class) in self.pooled.drain(..) {
+            give_upload(buffer, data as *mut u8, class);
+        }
     }
 }
 
@@ -3640,6 +3718,7 @@ impl Host {
                     self.card_sent();
                     *submitted += 1;
                     self.queue.Signal(&self.fence, *submitted)?;
+                    SIGNALLED.fetch_max(*submitted, Ordering::Release);
                     self.fence.SetEventOnCompletion(*submitted, self.event)?;
                     let was_working = working(false);
                     WaitForSingleObject(self.event, INFINITE);
@@ -4092,6 +4171,7 @@ impl Host {
                 self.queue.ExecuteCommandLists(&lists);
                 self.queue.Signal(&self.fence, *submitted)
             };
+            SIGNALLED.fetch_max(*submitted, Ordering::Release);
             self.card_sent();
             if let Err(e) = signalled {
                 fail(format_args!("a submission sent ahead could not be followed by a signal ({e})"));
@@ -4136,6 +4216,7 @@ impl Host {
                     .queue
                     .Signal(&self.fence, *submitted)
                     .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
+                SIGNALLED.fetch_max(*submitted, Ordering::Release);
                 match waited {
                     Ok(()) => {
                         working(false);
@@ -5037,9 +5118,13 @@ impl HostList {
     ///
     /// shortcut: one buffer per copy; pool them once uploads are frequent.
     pub(crate) fn upload(&self, host: &Host, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
-        let (buffer, data) = host.upload_buffer(size)?;
+        let (buffer, data, class) = host.pooled_upload(size)?;
         name(&buffer, || format!("list upload {size:#x}"));
-        self.deferred().hold_upload(buffer.clone(), size);
+        let mut deferred = self.deferred();
+        deferred.hold_upload(buffer.clone(), size);
+        if class != 0 {
+            deferred.pooled.push((buffer.clone(), data as usize, class));
+        }
         Some((buffer, data))
     }
 
@@ -5640,6 +5725,30 @@ impl Host {
                 None
             }
         }
+    }
+
+    /// A mapped upload buffer of `size` bytes or more, and its class for
+    /// [`give_upload`]: one nothing holds now that the card is done with
+    /// ([`SPARE_UPLOADS`]), its first `size` bytes zeroed as a new one's
+    /// are (a texture partly mapped leaves zeros where its memory is not),
+    /// or a new one.
+    pub(crate) fn pooled_upload(&self, size: u64) -> Option<(ID3D12Resource, *mut u8, u64)> {
+        if upload_pool_most() == 0 {
+            let (buffer, data) = self.upload_buffer(size)?;
+            return Some((buffer, data, 0));
+        }
+        let class = upload_class(size);
+        // SAFETY: a plain query.
+        let completed = unsafe { self.fence.GetCompletedValue() };
+        let kept = take_spare_upload(&mut SPARE_UPLOADS.lock().unwrap_or_else(|e| e.into_inner()), class, completed);
+        if let Some(s) = kept {
+            // SAFETY: the buffer's own mapping, `class` >= `size` bytes; the
+            // card is done with it and nothing else holds it.
+            unsafe { std::ptr::write_bytes(s.data as *mut u8, 0, size as usize) };
+            return Some((s.buffer, s.data as *mut u8, class));
+        }
+        let (buffer, data) = self.upload_buffer(class)?;
+        Some((buffer, data, class))
     }
 
     pub(crate) fn upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
@@ -6510,6 +6619,42 @@ mod spare {
         assert_eq!(spare.take(1), Some(2));
         assert_eq!(spare.bytes, 0);
         assert!(spare.kept.is_empty());
+    }
+
+    /// Upload buffers are made at a class at least their size, at most a
+    /// quarter more past 64 KiB, so near sizes share buffers.
+    #[test]
+    fn upload_classes_hold_their_size_with_a_quarter_more_at_most() {
+        use super::upload_class;
+        assert_eq!(upload_class(1), 64 << 10);
+        assert_eq!(upload_class(64 << 10), 64 << 10);
+        assert_eq!(upload_class((64 << 10) + 1), 80 << 10);
+        assert_eq!(upload_class(1 << 20), 1 << 20);
+        assert_eq!(upload_class((1 << 20) + 1), 1280 << 10);
+        assert_eq!(upload_class(1000 << 10), upload_class(1010 << 10), "near sizes, one class");
+        for size in (1..4000u64).map(|i| i * 12_345 + 7) {
+            let class = upload_class(size);
+            assert!(class >= size, "{size}");
+            assert!(class <= (size + size / 4).max(64 << 10), "{size} -> {class}");
+            assert_eq!(upload_class(class), class, "a class is its own class");
+        }
+    }
+
+    /// A spare upload buffer is taken again only by its class, and only
+    /// once the card has passed the fence value it was given back at.
+    #[test]
+    fn spare_uploads_wait_for_the_card() {
+        use super::{SpareUpload, take_spare_upload};
+        let buffer = |class: u64, after: u64| SpareUpload { buffer: 0u32, data: 0, class, after };
+        let mut spare = (vec![buffer(64, 5), buffer(64, 2), buffer(80, 1)], 208);
+        assert!(take_spare_upload(&mut spare, 64, 1).is_none(), "the card is not done with either");
+        assert_eq!(take_spare_upload(&mut spare, 64, 2).map(|s| s.after), Some(2));
+        assert!(take_spare_upload(&mut spare, 64, 4).is_none());
+        assert_eq!(take_spare_upload(&mut spare, 64, 9).map(|s| s.after), Some(5));
+        assert!(take_spare_upload(&mut spare, 64, 9).is_none(), "none left of the class");
+        assert_eq!(take_spare_upload(&mut spare, 80, 9).map(|s| s.class), Some(80));
+        assert_eq!(spare.1, 0);
+        assert!(spare.0.is_empty());
     }
 }
 
