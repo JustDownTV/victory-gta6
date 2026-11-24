@@ -5182,7 +5182,12 @@ fn wide_refresh() -> bool {
 /// once, it is checked again only after a step that writes title memory.
 #[derive(Default)]
 struct Batch {
-    refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    /// Per copy, the ranges asked for (`[from, to)`), merged only where they
+    /// touch or lie within `REFRESH_GAP` of each other when they are done:
+    /// one span from the lowest to the highest made a flush check every page
+    /// between them, ~7 GB of unchanged memory a frame in the first world
+    /// scene.
+    refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)>,
     /// Where each copy (by address) is in `refreshes`: the list that makes
     /// the heap's buffers ready adds some 4,100 copies, and searching them
     /// for every refresh of a submission was tens of millions of
@@ -5192,18 +5197,32 @@ struct Batch {
     textures: std::collections::HashSet<usize>,
 }
 
+/// Refreshed ranges of one copy closer than this are done as one (a few
+/// pages between them cost less than another write-watch asking).
+const REFRESH_GAP: usize = 256 << 10;
+
+/// `ranges` sorted and merged where they overlap or lie within `REFRESH_GAP`.
+fn merge_ranges(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    ranges.sort_unstable();
+    let mut out: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+    for (from, to) in ranges {
+        match out.last_mut() {
+            Some(last) if from <= last.1.saturating_add(REFRESH_GAP) => last.1 = last.1.max(to),
+            _ => out.push((from, to)),
+        }
+    }
+    out
+}
+
 impl Batch {
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
         let end = address + len;
         let key = std::sync::Arc::as_ptr(shadow) as usize;
         match self.index.get(&key) {
-            Some(&at) => {
-                let r = &mut self.refreshes[at];
-                (r.1, r.2) = (r.1.min(address), r.2.max(end));
-            }
+            Some(&at) => self.refreshes[at].1.push((address, end)),
             None => {
                 self.index.insert(key, self.refreshes.len());
-                self.refreshes.push((shadow.clone(), address, end));
+                self.refreshes.push((shadow.clone(), vec![(address, end)]));
             }
         }
     }
@@ -5214,12 +5233,14 @@ impl Batch {
         let Some(at) = self.index.remove(&(std::sync::Arc::as_ptr(shadow) as usize)) else {
             return;
         };
-        let (shadow, from, to) = self.refreshes.swap_remove(at);
+        let (shadow, ranges) = self.refreshes.swap_remove(at);
         // The last entry took its place.
         if let Some(moved) = self.refreshes.get(at) {
             self.index.insert(std::sync::Arc::as_ptr(&moved.0) as usize, at);
         }
-        Self::update(&shadow, from, to);
+        for (from, to) in merge_ranges(ranges) {
+            Self::update(&shadow, from, to);
+        }
     }
 
     /// Brings `[from, to)` of a copy up to date, timed.
@@ -5248,37 +5269,46 @@ impl Batch {
 
     fn flush(&mut self) {
         self.index.clear();
+        // each copy's ranges merged once, for the asking and the refresh
+        let merged: Vec<(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)> =
+            self.refreshes.drain(..).map(|(shadow, ranges)| (shadow, merge_ranges(ranges))).collect();
         // One write-watch asking for the copies that lie close together,
         // not one per copy.
-        let ahead = self.refreshes.len() > 1;
+        let ahead = merged.len() > 1;
         if ahead {
             let started = std::time::Instant::now();
-            let ranges: Vec<(usize, usize)> = self
-                .refreshes
+            let ranges: Vec<(usize, usize)> = merged
                 .iter()
                 .filter(|r| !r.0.unwatched())
-                .map(|r| (r.1, r.2))
+                .flat_map(|r| r.1.iter().copied())
                 .collect();
             crate::watch::ask_ahead(&ranges);
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
-        if wide_refresh() && self.refreshes.len() >= 4 {
+        if wide_refresh() && merged.len() >= 4 {
             // Each copy on its own, several at a time: a copy's refresh
             // writes that copy and reads title memory, nothing of another's.
             // The time counted is the time it took, not the threads' sum.
             let started = std::time::Instant::now();
             let before = PREPARING[0].load(Ordering::Relaxed);
-            let jobs: Vec<Box<dyn FnOnce() + Send>> = self
-                .refreshes
-                .drain(..)
-                .map(|(shadow, from, to)| Box::new(move || Self::update(&shadow, from, to)) as Box<dyn FnOnce() + Send>)
+            let jobs: Vec<Box<dyn FnOnce() + Send>> = merged
+                .into_iter()
+                .map(|(shadow, ranges)| {
+                    Box::new(move || {
+                        for (from, to) in ranges {
+                            Self::update(&shadow, from, to);
+                        }
+                    }) as Box<dyn FnOnce() + Send>
+                })
                 .collect();
             crate::shadow::wide_run(jobs);
             let summed = PREPARING[0].load(Ordering::Relaxed).saturating_sub(before);
             PREPARING[0].fetch_sub(summed.saturating_sub(started.elapsed().as_micros() as u64), Ordering::Relaxed);
         } else {
-            for (shadow, from, to) in self.refreshes.drain(..) {
-                Self::update(&shadow, from, to);
+            for (shadow, ranges) in merged {
+                for (from, to) in ranges {
+                    Self::update(&shadow, from, to);
+                }
             }
         }
         if ahead {
@@ -6411,6 +6441,19 @@ mod spare {
 mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at the top of this file
     use super::Batch;
     use std::sync::Arc;
+
+    /// A copy's refreshed ranges are done as asked: ranges that overlap or
+    /// lie within the gap merge, far ones stay apart (one span over all of
+    /// them checked every page between, ~7 GB a frame), in address order.
+    #[test]
+    fn refreshed_ranges_merge_only_when_close() {
+        use super::{REFRESH_GAP, merge_ranges};
+        let far = 64 << 20;
+        let got = merge_ranges(vec![(far, far + 4096), (0, 4096), (4096 + REFRESH_GAP, 2 * 4096 + REFRESH_GAP), (100, 200)]);
+        assert_eq!(got, vec![(0, 2 * 4096 + REFRESH_GAP), (far, far + 4096)]);
+        assert_eq!(merge_ranges(vec![(0, 10), (5, 8)]), vec![(0, 10)], "a range inside another");
+        assert!(merge_ranges(Vec::new()).is_empty());
+    }
 
     #[test]
     fn a_texture_is_checked_once_per_submission() {
