@@ -23,9 +23,15 @@ pub const ROOT_CBV_SPACE: u32 = 1;
 /// used-resource list only names what tables hold. A shader that has this
 /// root SRV also tells the host that the buffer views of the whole heap
 /// must be ready when it runs, not only those its tables name.
+/// After the strides, two more parts of as many dwords: the title address
+/// of the buffer view at each slot, low dword, then bits from 32 up (0:
+/// none), for programs that take a picked view's address and walk the
+/// memory behind it.
 pub const SLOT_STRIDES: u8 = 255;
-/// Dwords of the [`SLOT_STRIDES`] buffer: heap indices are clamped to it.
+/// Slots of the [`SLOT_STRIDES`] buffer: heap indices are clamped to it.
 pub const SLOT_STRIDES_COUNT: u32 = 1 << 21;
+/// Parts of the [`SLOT_STRIDES`] buffer, [`SLOT_STRIDES_COUNT`] dwords each.
+pub const SLOT_TABLE_PARTS: u32 = 3;
 
 /// Title memory by address (`resource::MEMORY`): console code reads and
 /// writes through raw 40-bit addresses it takes from root constants,

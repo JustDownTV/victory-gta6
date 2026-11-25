@@ -207,9 +207,10 @@ struct Lower<'a> {
     exports: HashMap<Site, &'a Export>,
     interps: HashMap<Site, &'a Interp>,
     handles: HashMap<(usize, Site, u8, bool, (u32, u32)), V>,
-    /// Element strides read from the host's table by heap slot
-    /// ([`super::shader::SLOT_STRIDES`]), by block and descriptor load.
-    strides: HashMap<(usize, Site, u8), V>,
+    /// Element strides and view addresses read from the host's table by
+    /// heap slot ([`super::shader::SLOT_STRIDES`]), by block, descriptor
+    /// load and part of the table.
+    strides: HashMap<(usize, Site, u8, u32), V>,
     /// Blocks splitting the edge from one IR block to another.
     edges: HashMap<(usize, usize), usize>,
     /// Per IR block: a `done` export is behind every lane entering it.
@@ -5775,10 +5776,17 @@ impl<'a> Lower<'a> {
             }
             // A buffer view the code only takes the address of, to walk
             // the memory behind it (a ray-tracing structure): the address
-            // from the host, the other dwords have no value.
-            if count <= 4
-                && let Some((lo, hi)) = self.view_address(site)
-            {
+            // from the host, through the table, or by heap slot for a view
+            // picked at a computed index (the shadow ray tracers,
+            // `CS_TraceShadowRays_*`); the other dwords have no value.
+            let address = match count <= 4 {
+                true => match self.view_address(site) {
+                    Some(a) => Some(a),
+                    None => self.slot_address(&Source::Loaded { load: site, first: 0 })?,
+                },
+                false => None,
+            };
+            if let Some((lo, hi)) = address {
                 for k in 0..count {
                     let reg = Reg::S(code + k as u8);
                     match k {
@@ -6428,6 +6436,25 @@ impl<'a> Lower<'a> {
     /// `ResourceHeap`): read from the host's table by heap slot in the
     /// current block.
     fn slot_stride(&mut self, src: &Source) -> Result<Option<V>, Why> {
+        self.slot_word(src, 0)
+    }
+
+    /// The title address (low dword, bits from 32 up) of the buffer view
+    /// `src` names, if the program picks it from the view heap at an index
+    /// it computes: read from the host's table by heap slot, as
+    /// [`Self::slot_stride`] (the shadow ray tracers take the address of
+    /// the ray-tracing structure from such a descriptor and walk it).
+    fn slot_address(&mut self, src: &Source) -> Result<Option<(V, V)>, Why> {
+        let (Some(lo), Some(hi)) = (self.slot_word(src, 1)?, self.slot_word(src, 2)?) else {
+            return Ok(None);
+        };
+        Ok(Some((lo, hi)))
+    }
+
+    /// Dword `part` of the host's table by heap slot
+    /// ([`super::shader::SLOT_STRIDES`]) for the buffer view `src` names, if
+    /// the program picks it from the view heap at an index it computes.
+    fn slot_word(&mut self, src: &Source, part: u32) -> Result<Option<V>, Why> {
         let Source::Loaded { load, first } = src else {
             return Ok(None);
         };
@@ -6439,7 +6466,7 @@ impl<'a> Lower<'a> {
         if !heap {
             return Ok(None);
         }
-        let key = (self.cur, *load, *first);
+        let key = (self.cur, *load, *first, part);
         if let Some(&v) = self.strides.get(&key) {
             return Ok(Some(v));
         }
@@ -6449,8 +6476,12 @@ impl<'a> Lower<'a> {
         // compute one too): a root view has no bounds of its own.
         let last = self.s.m.i32(super::shader::SLOT_STRIDES_COUNT - 1);
         let i32t = self.s.t.i32;
-        let slot = self.s.op(c, "binary.i32", Attr::ReadNone, i32t, 40, &[slot, last]);
+        let mut slot = self.s.op(c, "binary.i32", Attr::ReadNone, i32t, 40, &[slot, last]);
         self.s.m.tag(slot, Tag::Clamp);
+        if part > 0 {
+            let at = self.s.m.i32(part * super::shader::SLOT_STRIDES_COUNT);
+            slot = self.s.m.bin(c, Bin::Add, slot, at);
+        }
         let two = self.s.m.i32(2);
         let byte = self.s.m.bin(c, Bin::Shl, slot, two);
         let h = self.s.root_srv_handle(super::shader::SLOT_STRIDES);
@@ -11582,6 +11613,35 @@ mod tests {
             }]
         };
         lower_with(&words, layout(), used()).unwrap();
+    }
+
+    #[test]
+    fn a_heap_descriptor_read_for_its_address_walks_the_memory_behind_it() {
+        // The shadow ray tracers' pattern: a buffer descriptor from the view
+        // heap at an offset the title computes (here from a root constant,
+        // 32 bytes a slot), its address alone kept (the high dword's stride
+        // masked off), and a dword of the memory at that address read and
+        // stored to LDS.
+        let words = [
+            0xBE81_0380, // s_mov_b32 s1, 0
+            0x8F03_8502, // s_lshl_b32 s3, s2, 5
+            0xF408_0200,
+            0x0600_0000, // s_load_dwordx4 s[8:11], s[0:1], s3
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0x8709_FF09,
+            0x0000_FFFF, // s_and_b32 s9, s9, 0xffff
+            0xF400_0304,
+            0xFA00_0000, // s_load_dword s12, s[8:9], null
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0x7E02_020C, // v_mov_b32 v1, s12
+            0xD834_0000,
+            0x0000_0100, // ds_write_b32 v0, v1
+            S_ENDPGM,
+        ];
+        let layout = vec![root(RootType::ResourceHeap, 0, 0), root(RootType::Constants, 2, 1)];
+        let lowered = lower_with(&words, layout, vec![]).unwrap();
+        // The address comes from the host's table by heap slot.
+        assert!(lowered.root_srvs.contains(&super::super::shader::SLOT_STRIDES));
     }
 
     /// Tables of 2D textures at s0 and samplers at s1.

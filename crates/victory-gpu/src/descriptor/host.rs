@@ -608,14 +608,16 @@ impl HostHeap {
         ));
         let strides = (!sampler)
             .then(|| {
-                let bytes = u64::from(victory_shader::emit::SLOT_STRIDES_COUNT) * 4;
+                let bytes = u64::from(victory_shader::emit::SLOT_STRIDES_COUNT)
+                    * u64::from(victory_shader::emit::SLOT_TABLE_PARTS)
+                    * 4;
                 let (buffer, data) = host.upload_buffer(bytes)?;
                 // SAFETY: the buffer's whole mapping; a live buffer.
                 let gpu = unsafe {
                     std::ptr::write_bytes(data, 0, bytes as usize);
                     buffer.GetGPUVirtualAddress()
                 };
-                crate::host::name(&buffer, || "element strides by view heap slot".to_owned());
+                crate::host::name(&buffer, || "element strides and addresses by view heap slot".to_owned());
                 Some((buffer, gpu, data as usize))
             })
             .flatten();
@@ -1039,9 +1041,18 @@ impl HostHeap {
         if let Some((_, _, data)) = &self.strides
             && index < victory_shader::emit::SLOT_STRIDES_COUNT
         {
-            // SAFETY: inside the mapping; shaders read it while we write (a
-            // dword, either value is one the slot had).
-            unsafe { (*data as *mut u32).add(index as usize).write_volatile(stride.unwrap_or(0)) };
+            // The view's title address, for programs that walk the memory
+            // behind a view they pick by index.
+            let address = stride.and(view).and_then(buffer_range).map_or(0, |r| r.0);
+            let count = victory_shader::emit::SLOT_STRIDES_COUNT as usize;
+            let words = [stride.unwrap_or(0), address as u32, (address >> 32) as u32];
+            for (part, word) in words.into_iter().enumerate() {
+                // SAFETY: inside the mapping; shaders read it while we
+                // write (a dword, either value is one the slot had).
+                // shortcut: a shader reading while the slot changes can see
+                // one address's low half with the other's high half.
+                unsafe { (*data as *mut u32).add(part * count + index as usize).write_volatile(word) };
+            }
         }
         let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
         let was = if stride.is_some() {
