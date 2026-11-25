@@ -5015,6 +5015,23 @@ impl Host {
                 let behind = flights.iter().map(|f| f.fence).max().unwrap_or(0);
                 let landed = flights.iter().map(|f| f.number).max().unwrap_or(0);
                 self.relay_card_back(&plans, fetch, behind, landed);
+                // With timing on, the flights' lists are read once they have
+                // run: each noted command's time on the card goes to the
+                // sums by pipeline, with no list submitted on its own (the
+                // synchronous form of `VICTORY_GPU_TIMING` lost the device
+                // in this title, runs of 25/11).
+                #[cfg(feature = "diagnostics")]
+                if timing() {
+                    // SAFETY: a plain query.
+                    let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
+                    for flight in &flights {
+                        for list in &flight.lists {
+                            for (ms, op) in list.host().slowest(frequency, usize::MAX) {
+                                crate::copystat::command_took(&op, ms);
+                            }
+                        }
+                    }
+                }
                 let mut back: Vec<Declared> = Vec::new();
                 for flight in &flights {
                     for (shadow, ranges) in &flight.back {
@@ -6507,7 +6524,7 @@ impl HostList {
 
     #[cfg(feature = "diagnostics")]
     fn note(&self, what: impl FnOnce() -> String, range: Option<(u64, u64)>) {
-        if !dred_on() {
+        if !dred_on() && !timing() {
             crate::capture::op(std::ptr::from_ref(self) as usize, what);
             return;
         }
@@ -6520,12 +6537,16 @@ impl HostList {
             }
             let what = what();
             crate::capture::op(std::ptr::from_ref(self) as usize, || what.clone());
-            let text: Vec<u16> = what.encode_utf16().chain([0]).collect();
-            const UNICODE: u32 = 0;
-            // SAFETY: an open list; the marker is copied when recorded.
-            unsafe {
-                self.list.SetMarker(UNICODE, Some(text.as_ptr().cast()), 2 * text.len() as u32)
-            };
+            // The markers are for the device-removed report; timing alone
+            // (`VICTORY_GPU_TIMING` without DRED) only needs the texts.
+            if dred_on() {
+                let text: Vec<u16> = what.encode_utf16().chain([0]).collect();
+                const UNICODE: u32 = 0;
+                // SAFETY: an open list; the marker is copied when recorded.
+                unsafe {
+                    self.list.SetMarker(UNICODE, Some(text.as_ptr().cast()), 2 * text.len() as u32)
+                };
+            }
             self.notes
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
