@@ -1769,7 +1769,7 @@ void main(uint3 group : SV_GroupID, uint t : SV_GroupIndex) {
 /// exact and when a landing falls back to the old fetch.
 fn inflight_fetch() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| relay() && std::env::var_os("VICTORY_CARD_FETCH_INFLIGHT").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| relay() && std::env::var_os("VICTORY_CARD_FETCH_INFLIGHT").is_some_and(|v| v == "1"))
 }
 
 /// The bytes of the PC's memory pieces fetched inside flights go to

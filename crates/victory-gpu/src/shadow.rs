@@ -745,22 +745,41 @@ impl Flights {
 /// read, could undo that write. (The merge of a waited-for submission
 /// stores every byte of a differing stretch back into the copy.)
 fn merge_piece(now: &[u8], held: &mut [u8], title: &mut [u8], mask: &mut [u8]) -> bool {
+    let len = now.len().min(held.len()).min(title.len()).min(mask.len());
     let mut differs = 0u8;
-    for (((n, h), t), m) in now
-        .iter()
-        .zip(held.iter_mut())
-        .zip(title.iter_mut())
-        .zip(mask.iter_mut())
-    {
-        let wrote = if *n != *h { 0xffu8 } else { 0 };
-        let merged = (*t & !wrote) | (*n & wrote);
-        let changed = merged ^ *t;
-        *m = changed;
-        differs |= changed;
-        *t = merged;
-        *h = (*h & !wrote) | (*n & wrote);
+    let mut i = 0;
+    // Word by word: a word the card did not change is skipped whole.
+    while i + 8 <= len {
+        let nw = u64::from_ne_bytes(now[i..i + 8].try_into().unwrap());
+        let hw = u64::from_ne_bytes(held[i..i + 8].try_into().unwrap());
+        if nw != hw {
+            for k in i..i + 8 {
+                differs |= merge_byte(now[k], &mut held[k], &mut title[k], &mut mask[k]);
+            }
+        } else {
+            mask[i..i + 8].fill(0);
+        }
+        i += 8;
+    }
+    while i < len {
+        differs |= merge_byte(now[i], &mut held[i], &mut title[i], &mut mask[i]);
+        i += 1;
     }
     differs != 0
+}
+
+/// One byte of [`merge_piece`]: the card's where it changed it, and in
+/// `mask` the bits that changes in title memory.
+fn merge_byte(n: u8, h: &mut u8, t: &mut u8, m: &mut u8) -> u8 {
+    if n == *h {
+        *m = 0;
+        return 0;
+    }
+    let changed = n ^ *t;
+    *m = changed;
+    *t = n;
+    *h = n;
+    changed
 }
 
 /// Synchronous card-buffer merge of a stretch ([`Shadow::card_merge`]):

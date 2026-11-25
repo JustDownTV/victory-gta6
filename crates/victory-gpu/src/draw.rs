@@ -3070,15 +3070,33 @@ impl State {
                 let (step, records) = match &self.window {
                     Some(w) if windowed && same(w) => {
                         let last = w.base + u64::from(w.records - 1) * u64::from(w.step);
-                        let step = offset.saturating_sub(last);
-                        let walks = step >= u64::from(stride)
-                            && step <= 256
-                            && step % 4 == 0
-                            && (w.records == 1 || step == u64::from(w.step));
+                        let diff = offset.saturating_sub(last);
+                        // When the title walks forward through the argument
+                        // buffer (even skipping culled slots), clamp densely
+                        // at `stride` if `diff` is a multiple of `stride` so
+                        // skipped/sparse slots still hit; otherwise keep the
+                        // observed record step.
+                        let (candidate_step, walks) = if diff >= u64::from(stride)
+                            && diff <= 1024
+                            && diff % u64::from(stride) == 0
+                        {
+                            (u64::from(stride), true)
+                        } else if diff >= u64::from(stride)
+                            && diff <= 512
+                            && diff % 4 == 0
+                            && (w.records == 1 || diff % u64::from(w.step) == 0)
+                        {
+                            (if w.records == 1 { diff } else { u64::from(w.step) }, true)
+                        } else {
+                            (u64::from(stride), false)
+                        };
                         if walks {
-                            let fit = (args.left(arguments) / step).min(WINDOW_MOST) as u32;
+                            let fit = (args.left(arguments) / candidate_step).min(WINDOW_MOST) as u32;
                             if fit >= 2 {
-                                (step as u32, (if w.records == 1 { 16 } else { w.records * 2 }).min(fit))
+                                (
+                                    candidate_step as u32,
+                                    (if w.records == 1 { 32 } else { w.records * 2 }).min(fit),
+                                )
                             } else {
                                 (stride, max)
                             }
