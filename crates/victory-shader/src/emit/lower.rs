@@ -1394,6 +1394,7 @@ impl<'a> Lower<'a> {
                 let n = i.name();
                 n.starts_with("ds_swizzle")
                     || n.contains("permute")
+                    || n.starts_with("v_permlane")
                     || n.starts_with("v_mbcnt")
                     || matches!(n, "v_readlane_b32" | "v_writelane_b32")
                     || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
@@ -7483,6 +7484,35 @@ impl<'a> Lower<'a> {
                         .or_insert(Val::Missing("a lane mask read as data"));
                 }
                 Ok(())
+            }
+            "v_permlane16_b32" | "v_permlanex16_b32" => {
+                // Each lane reads lane `sel` of its own row of 16 (`v_permlane16`) or of the
+                // other row of its 32 lanes (`v_permlanex16`), `sel` being nibble (lane % 16)
+                // of {src2, src1}. The ISA keeps both inside 32-lane halves, which a host wave
+                // of 32 holds whole (only whole-wave sections had them, `wave.rs`).
+                // shortcut: a source lane outside EXEC is read as the host has it; the
+                // fetch-inactive and bound-control bits are not followed.
+                self.cross_lane(false)?;
+                let (x, s1, s2) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
+                let lane = self.lane_index();
+                let k = |l: &mut Self, v: u32| l.s.m.i32(v);
+                let (k15, k7, k2) = (k(self, 15), k(self, 7), k(self, 2));
+                let i = self.s.m.bin(c, Bin::And, lane, k15);
+                let upper = self.s.m.cmp(c, pred::IUGT, i, k7);
+                let word = self.s.m.select(c, upper, s2, s1);
+                let n = self.s.m.bin(c, Bin::And, i, k7);
+                let shift = self.s.m.bin(c, Bin::Shl, n, k2);
+                let sel = self.s.m.bin(c, Bin::LShr, word, shift);
+                let sel = self.s.m.bin(c, Bin::And, sel, k15);
+                let row = k(self, !15);
+                let mut base = self.s.m.bin(c, Bin::And, lane, row);
+                if name == "v_permlanex16_b32" {
+                    let k16 = k(self, 16);
+                    base = self.s.m.bin(c, Bin::Xor, base, k16);
+                }
+                let from = self.s.m.bin(c, Bin::Or, base, sel);
+                let r = self.read_lane(x, from);
+                int(self, r)
             }
             "v_readlane_b32" => {
                 let (a, lane) = (s(self, 0)?, s(self, 1)?);

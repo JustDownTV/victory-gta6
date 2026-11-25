@@ -597,3 +597,114 @@ fn threaded_wave64_compute_still_runs_wave32_retries() {
             .expect("DXIL validation failed");
     }
 }
+
+/// `v_permlane16_b32` and `v_permlanex16_b32` outside a whole-wave section (a water program of
+/// the title, `CS_WaterTransmittanceOpticalDepthProcessing`, did not translate): lane `l`
+/// reads, in its own row of 16 or in the other row of its 32 lanes, the lane that nibble
+/// `l % 16` of {s1, s0} names. Each of the 64 threads stores what it read of `100 + lane`.
+#[test]
+fn permlanes_read_their_row_or_the_other_row_of_their_half() {
+    for (x16, op) in [(false, 0xD777_0006u32), (true, 0xD778_0006)] {
+        let words = [
+            0x4A0A_00FF,
+            100,         // v_add_nc_u32 v5, 100, v0
+            op,          // v_permlane(x)16_b32 v6, v5, s0, s1
+            0x0004_0105, //
+            0x340E_0082, // v_lshlrev_b32 v7, 2, v0
+            0xE070_1000,
+            0x8002_0607, // buffer_store_dword v6, v7, s[8:11], 0 offen
+        ];
+        let native = native(&words);
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        let (shader, wave_size) = lowered_wave(&native, &p, &HashSet::new()).expect("lower");
+        assert_eq!(wave_size, Some(32), "rows stay inside 32-lane halves");
+        if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+            v.validate(&mut shader.dxil.clone()).expect("DXIL validation failed");
+        }
+        let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        for (s0, s1) in [(0x7654_3210u32, 0xFEDC_BA98u32), (0x89AB_CDEF, 0x0123_4567), (0x1111_0000, 0xF0F0_3C3C)] {
+            let Some(got) = on_the_card_64(&shader, [s0, s1]) else {
+                return;
+            };
+            for (lane, &value) in got.iter().enumerate() {
+                let i = lane % 16;
+                let sel = (if i < 8 { s0 } else { s1 }) >> (4 * (i % 8)) & 15;
+                let row = if x16 { (lane & !31) | ((lane & 16) ^ 16) } else { lane & !15 };
+                let expected = 100 + (row | sel as usize) as u32;
+                assert_eq!(value, expected, "x16 {x16}, s0 {s0:#x} s1 {s1:#x}: lane {lane}");
+            }
+        }
+        eprintln!("ran on the hardware device: v_permlane{}16_b32", if x16 { "x" } else { "" });
+    }
+}
+
+/// Runs a 64-thread shader on the hardware device and returns all 64 output UAV dwords.
+fn on_the_card_64(shader: &HostShader, constants: [u32; 2]) -> Option<Vec<u32>> {
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; not run");
+        return None;
+    };
+    let Ok((root, pso)) = host.compute_pipeline(shader) else {
+        eprintln!("the hardware device does not take this program; not run");
+        return None;
+    };
+    let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+    for u in &shader.user_data {
+        if let (RootType::Constants, 0, d @ 0..=1) = (u.root, u.slot, u.dword) {
+            ud[u.index as usize] = constants[d as usize];
+        }
+    }
+    let out = host
+        .dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots: vec![(0, Root::Constants(ud))],
+                views: &[View::RawUav(64)],
+                samplers: &[],
+                groups: [1, 1, 1],
+            },
+        )
+        .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+    Some(out[0].clone())
+}
+
+/// Lowers `native` for a 32-lane host: the host shader and the wave size it requires.
+fn lowered_wave(
+    native: &NativeProgram,
+    p: &ir::Program,
+    wide: &HashSet<usize>,
+) -> Result<(HostShader, Option<u32>), ShaderError> {
+    let st = structure::structure_wide(p, wide).expect("structure");
+    let res = resource::track(p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(p, native).expect("io::raise");
+    let was = lower::TEST_HOST_WAVE.replace(Some(32));
+    let lowered = lower::lower(&lower::Parts {
+        native,
+        p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+    });
+    lower::TEST_HOST_WAVE.set(was);
+    let lowered = lowered?;
+    let wave_size = lowered.wave_size;
+    Ok((
+        HostShader {
+            stage: HwStage::Cs,
+            dxil: lowered.dxil,
+            user_data: lowered.user_data,
+            samplers: lowered.samplers,
+            static_samplers: Vec::new(),
+            root_cbvs: lowered.root_cbvs,
+            root_srvs: lowered.root_srvs,
+            root_uavs: lowered.root_uavs,
+            root_indexed_views: res.root_indexed_views,
+        },
+        wave_size,
+    ))
+}
