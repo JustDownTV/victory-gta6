@@ -360,9 +360,10 @@ pub(crate) fn bound_ahead(
     list: &HostList,
     src: (&ID3D12Resource, u64),
     spec: (u32, u32, u32),
+    slot: usize,
 ) -> Option<ID3D12Resource> {
     let bytes = validate_layout(spec, src.1, None)?;
-    let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
+    let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch_in(slot, bytes)?);
     clamp_into(list, c, &dst, budget, src, None, spec, true).then_some(dst)
 }
 
@@ -1879,7 +1880,7 @@ void main() {
             std::ptr::copy_nonoverlapping([11u32, 2, 1].as_ptr().cast::<u8>(), patch_ptr, 12);
         }
         let spec = (KIND_DISPATCH, STEP, records.len() as u32);
-        let scratch = bound_ahead(&list, (&src, 0), spec).unwrap();
+        let scratch = bound_ahead(&list, (&src, 0), spec, 1).unwrap();
         // Record 0: nothing wrote it.
         assert!(check_hit(&list, (&src, 0), (KIND_DISPATCH, STEP), &scratch, 0));
         // Record 1 is written on the card after the window's clamp.
@@ -2053,7 +2054,7 @@ void main() {
             unsafe { std::ptr::write_bytes(hits_ptr, 0, 256) };
             for (groups, src) in windows.iter().zip(&sources) {
                 let spec = (KIND_DISPATCH, STEP, groups.len() as u32);
-                let scratch = bound_ahead(&list, (src, 0), spec).unwrap();
+                let scratch = bound_ahead(&list, (src, 0), spec, 1).unwrap();
                 assert_eq!(list.indirect_state(&scratch), D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
                 // SAFETY: an open list; the worker's root signature and
                 // pipeline; buffers the test holds until the list has run.

@@ -801,7 +801,9 @@ pub(crate) struct HostList {
     card_budget: OnceLock<Option<ID3D12Resource>>,
     /// Device-local scratch buffer for clamped indirect arguments (`indirect`),
     /// grown to the largest indirect execution recorded on the list.
-    indirect_args: Mutex<Option<(ID3D12Resource, u64)>>,
+    /// Slot 0: clamps of one call; slots 1 and 2: the two windows a title
+    /// list may keep open at once (`crate::draw`'s windows).
+    indirect_args: Mutex<[Option<(ID3D12Resource, u64)>; 3]>,
     /// The buffers of `crate::indirect::window_check`, made at its first use.
     window_check: OnceLock<Option<crate::indirect::WindowCheck>>,
     /// Counts the list in [`ALIVE`] while it lives.
@@ -2011,7 +2013,7 @@ struct Deferred {
     /// interface pointer) that a clamp in this recording left readable as
     /// indirect arguments; 0 if none. It stays readable until the next
     /// clamp into it ([`HostList::indirect_state`]).
-    indirect_readable: usize,
+    indirect_readable: [usize; 3],
 }
 
 impl Deferred {
@@ -6117,7 +6119,7 @@ impl HostList {
     pub(crate) fn close(&self) {
         self.twins_to_depth();
         let scratch = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        if let Some((scratch, _)) = scratch {
+        for (scratch, _) in scratch.into_iter().flatten() {
             self.indirect_common(&scratch);
         }
         self.card_budget_out();
@@ -6812,8 +6814,14 @@ impl HostList {
     /// list. Smaller buffers replaced mid-list stay alive until
     /// [`HostList::reset`].
     pub(crate) fn indirect_scratch(&self, size: u64) -> Option<ID3D12Resource> {
+        self.indirect_scratch_in(0, size)
+    }
+
+    /// As [`HostList::indirect_scratch`], the buffer of slot `at` (0 to 2).
+    pub(crate) fn indirect_scratch_in(&self, at: usize, size: u64) -> Option<ID3D12Resource> {
         let needed = size.max(64 << 10);
-        let mut slot = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner());
+        let mut slots = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner());
+        let slot = &mut slots[at];
         if let Some((buffer, cap)) = &*slot
             && *cap >= needed
         {
@@ -6827,7 +6835,7 @@ impl HostList {
         let buffer = host()?.uav_buffer(alloc)?;
         name(&buffer, || format!("indirect arguments {alloc:#x}"));
         let old = slot.replace((buffer.clone(), alloc));
-        drop(slot);
+        drop(slots);
         if let Some((old_buf, _)) = old {
             // It ends the list common, as every scratch buffer does.
             self.indirect_common(&old_buf);
@@ -6845,10 +6853,11 @@ impl HostList {
     fn indirect_common(&self, scratch: &ID3D12Resource) {
         {
             let mut deferred = self.deferred();
-            if deferred.indirect_readable != scratch.as_raw() as usize {
+            let raw = scratch.as_raw() as usize;
+            let Some(at) = deferred.indirect_readable.iter().position(|&r| r == raw) else {
                 return;
-            }
-            deferred.indirect_readable = 0;
+            };
+            deferred.indirect_readable[at] = 0;
         }
         let barrier = transition(
             scratch,
@@ -6866,7 +6875,7 @@ impl HostList {
     /// common: the state a buffer is made in, and the one a recording
     /// leaves it in when it closes or replaces it ([`HostList::indirect_common`]).
     pub(crate) fn indirect_state(&self, scratch: &ID3D12Resource) -> D3D12_RESOURCE_STATES {
-        if self.deferred().indirect_readable == scratch.as_raw() as usize {
+        if self.deferred().indirect_readable.contains(&(scratch.as_raw() as usize)) {
             D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT
         } else {
             D3D12_RESOURCE_STATE_COMMON
@@ -6877,7 +6886,13 @@ impl HostList {
     /// arguments. It stays so for every execution that reads it, until the
     /// next clamp moves it back to unordered access.
     pub(crate) fn indirect_readable(&self, scratch: &ID3D12Resource) {
-        self.deferred().indirect_readable = scratch.as_raw() as usize;
+        let raw = scratch.as_raw() as usize;
+        let mut deferred = self.deferred();
+        if !deferred.indirect_readable.contains(&raw)
+            && let Some(free) = deferred.indirect_readable.iter_mut().find(|r| **r == 0)
+        {
+            *free = raw;
+        }
     }
 
     /// The list's buffers for `crate::indirect::window_check`.
@@ -7562,6 +7577,11 @@ impl Meter {
         let indirect = crate::list::take_indirect() as f64 / frames;
         let mesh_largest = MESH_GROUPS[0].swap(0, Ordering::Relaxed);
         let mesh_groups = MESH_GROUPS[1].swap(0, Ordering::Relaxed) as f64 / frames;
+        let w = crate::draw::take_window_stats().map(|n| n as f64 / frames);
+        tracing::info!(
+            "indirect calls per frame by how their record was clamped: {:.0} from an open window, {:.0} windows clamped,              {:.0} alone (no walk), {:.0} alone (count buffer or several records), {:.0} alone (shaders store), {:.0} dispatches;              the alone with no walk: {:.0} no walk yet in the list, {:.0} the last walk of another copy, {:.0} behind it,              {:.0} ahead past 256 bytes or off its step",
+            w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], w[8], w[9]
+        );
         tracing::info!(
             "indirect mesh dispatches: the largest group count asked for {mesh_largest} (run: at most 65535), {mesh_groups:.0} groups asked per frame"
         );
