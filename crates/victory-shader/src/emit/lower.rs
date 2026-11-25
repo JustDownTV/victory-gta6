@@ -865,6 +865,13 @@ fn lds_lane_private(p: &crate::ir::Program) -> bool {
     if std::env::var_os("VICTORY_WAVE_LDS_ASSUME").is_some_and(|v| v == "1") {
         return true;
     }
+    // `VICTORY_WAVE_LDS_ASSUME_ONLY=<hash>,...`: assumed for the listed
+    // programs alone (the hair shadow masks, `SampleHairScreenSpace`: their
+    // LDS addresses are the analysis's blind spot, and refused they leave
+    // hair edges lit orange).
+    if super::per_program::names_current("VICTORY_WAVE_LDS_ASSUME_ONLY") {
+        return true;
+    }
     use crate::ir::{Reg, Value};
     // the one instruction that writes each value (SSA: at most one)
     let mut def: std::collections::HashMap<Value, &crate::ir::Inst> =

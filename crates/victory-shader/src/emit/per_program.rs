@@ -89,6 +89,15 @@ pub fn wave64_retried(container: &[u8]) -> bool {
             .is_some_and(|p| p.stage == HwStage::Cs && p.wave64)
 }
 
+/// Whether the switch `name` (a list of hashes, as the `_NOT` and `_ONLY`
+/// ones) names the program being translated on this thread.
+pub(super) fn names_current(name: &str) -> bool {
+    let Ok(value) = std::env::var(name) else {
+        return false;
+    };
+    listed(&parse_hash_list(&value), current().as_deref())
+}
+
 /// The hashes of a `_NOT` or `_ONLY` list: separated by commas, semicolons
 /// or white space, each with or without the `#` the offline listing puts
 /// before it, in lower case and cut to the 16 digits a hash has. Pure, for
