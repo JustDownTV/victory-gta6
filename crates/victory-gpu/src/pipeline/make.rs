@@ -429,9 +429,9 @@ mod tests {
         // Simulate a pipeline already claimed by a worker that has not finished.
         p.queue_state.store(MAKING, Ordering::Relaxed);
         let first_frame = crate::frame::current();
-        // Pretend it already exhausted its wait on an earlier frame.
-        p.waited_frame
-            .store(first_frame.wrapping_sub(1), Ordering::Relaxed);
+        // Pretend it already exhausted its wait on another frame (avoid u64::MAX sentinel).
+        let earlier_frame = if first_frame == 0 { 1 } else { first_frame - 1 };
+        p.waited_frame.store(earlier_frame, Ordering::Relaxed);
         let p = Arc::new(p);
         let started = Instant::now();
         assert!(ready(&p).is_none());
