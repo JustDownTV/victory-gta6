@@ -1748,8 +1748,8 @@ void main(uint3 group : SV_GroupID, uint t : SV_GroupIndex) {
 "#;
 
 /// Whether the pieces a flight's compare flags come down to the PC inside
-/// the flight itself (`VICTORY_CARD_FETCH_INFLIGHT=0` to disable; on by
-/// default with [`relay`]).
+/// the flight itself (`VICTORY_CARD_FETCH_INFLIGHT=1`; off by default, and
+/// only with [`relay`]).
 ///
 /// With the relay the thread that lands flights fetched the flagged pieces
 /// with a list of its own on the host's queue, the one the submitting
