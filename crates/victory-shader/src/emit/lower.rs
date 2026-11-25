@@ -329,6 +329,13 @@ enum MaskData {
 
 /// What a value holding a lane mask read as a number stops with.
 pub(super) const LANE_MASK: Why = "a lane mask read as data";
+
+/// The hardware register a pixel program with an ordered section sets
+/// before it (see [`Lower::inputs`]).
+const HW_REG_POPS_PACKER: u16 = 25;
+
+/// The scalar source `src_pops_exiting_wave_id` (see [`Lower::inputs`]).
+const SRC_POPS_EXITING_WAVE_ID: u8 = 239;
 /// A mask with lanes outside EXEC where it is written, read as a number where the lanes that
 /// run that block are not all of the wave.
 pub(super) const MASK_ELSEWHERE: Why = "a lane mask holding lanes elsewhere read as data";
@@ -2142,6 +2149,18 @@ impl<'a> Lower<'a> {
     /// Values of the program's input registers.
     fn inputs(&mut self) -> Result<(), Stop> {
         let io_inputs: HashMap<Value, Input> = self.x.io.inputs.iter().copied().collect();
+        // A pixel program with a section ordered among the waves that cover
+        // the same pixels (POPS: the console's rasterizer-ordered pixels)
+        // waits there until the waves before it have left, by the collision
+        // wave id the hardware gives in an SGPR and `src_pops_exiting_wave_id`.
+        // Both read as 0, "no earlier wave overlaps": the program skips the
+        // wait and runs its section at once.
+        // shortcut: overlapping pixels of one draw are not ordered on the
+        // host (a rasterizer-ordered view would order them).
+        let pops = self.x.p.blocks.iter().flat_map(|b| &b.insts).any(|i| {
+            i.name().starts_with("s_setreg")
+                && matches!(i.fields, Fields::Sop { imm: Some(hwreg), .. } if hwreg & 0x3F == HW_REG_POPS_PACKER)
+        });
         for &(reg, v) in &self.x.p.inputs {
             let val = match reg {
                 Reg::S(_) if self.params.contains_key(&v) => continue, // loaded on first use
@@ -2164,6 +2183,7 @@ impl<'a> Lower<'a> {
                     // paths only seem to allow it before any save: the lane of a VGPR
                     // nobody wrote, and VGPRs nobody set read as zero.
                     None if n >= crate::ir::PARKED => Val::I32(self.s.m.i32(0)),
+                    None if pops => Val::I32(self.s.m.i32(0)),
                     None => Val::Missing("a hardware SGPR input"),
                 },
                 Reg::Scc => Val::Missing("SCC on entry"),
@@ -3016,6 +3036,8 @@ impl<'a> Lower<'a> {
                 let v = inst.read(Reg::V(reg)).ok_or("an unread operand")?;
                 self.i32_of(v)
             }
+            // `src_pops_exiting_wave_id`: no earlier wave overlaps (`Lower::inputs`).
+            Operand::Const(SRC_POPS_EXITING_WAVE_ID) => Ok(self.s.m.i32(0)),
             Operand::Const(c) => crate::resource::inline(c)
                 .map(|x| self.s.m.i32(x))
                 .ok_or("a special operand (vccz, execz, scc, lds_direct)"),
@@ -4800,6 +4822,11 @@ impl<'a> Lower<'a> {
         let lo = dst_code.and_then(|c| inst.write(Reg::S(c)));
         if inst.write(Reg::S(EXEC)).is_some() || self.is_mask(lo) {
             return Err(LANE_MASK);
+        }
+        // The POPS packer a pixel program picks before its ordered section:
+        // the host orders nothing (`Lower::inputs`), so there is nothing to pick.
+        if name.starts_with("s_setreg") && imm.is_some_and(|hwreg| hwreg & 0x3F == HW_REG_POPS_PACKER) {
+            return Ok(());
         }
         if matches!(
             name,
