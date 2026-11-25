@@ -69,9 +69,14 @@ pub(crate) fn all() -> Vec<HleModule> {
     all.push(net::module());
     #[cfg(windows)]
     all.push(xmem::module());
+    // The title's memory calls: #772's wrappers when they are on (their
+    // `VirtualAlloc` also tells the GPU side of commits), else ours alone
+    // while the GPU side wants to be told of commits.
     #[cfg(windows)]
-    if victory_gpu::title_pages_told() {
-        all.push(xmem::host_memory_module());
+    match xmem::calls_module() {
+        Some(calls) => all.push(calls),
+        None if victory_gpu::title_pages_told() => all.push(xmem::host_memory_module()),
+        None => {}
     }
     #[cfg(windows)]
     all.push(xsystem::module());

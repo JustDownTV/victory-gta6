@@ -83,8 +83,10 @@ struct Memory {
     /// Separate fault buffer for read-only / quarantined shaders (`!writes`) so
     /// they never pollute `faults`'s dirty-page bitmask tail.
     quarantine_faults: (ID3D12Resource, *mut u32, u64),
-    /// Copy `n` is `copies[n - 1]`.
-    copies: Vec<Arc<Shadow>>,
+    /// Copy `n` is `copies[n - 1]`; `None`: numbered again ([`Memory::retarget`]).
+    copies: Vec<Option<Arc<Shadow>>>,
+    /// `crate::resident::generation` at the last [`Memory::retarget`].
+    generation: u64,
     /// Per dirty 64 KiB page (harvested by `take_dirty`): `(copy_index, last_dirty_frame)`.
     dirty_pages: BTreeMap<u32, (usize, u64)>,
     /// Total bytes of loose (non-buffer) windows added to `copies`.
@@ -105,6 +107,24 @@ struct Memory {
 unsafe impl Send for Memory {}
 
 static MEMORY: Mutex<Option<Memory>> = Mutex::new(None);
+
+/// The directory's offset for title address `at` (in `shadow`): its byte
+/// offset from the copy's host buffer's first byte. For title memory in
+/// place (`crate::inplace`) the buffer begins on the 64 KiB line, or at an
+/// arena's base, before the title memory: `Shadow::offset` adds that bias
+/// (design §11, bug 1: the offset from the title memory's first byte was
+/// off by the bias).
+fn entry_offset(shadow: &Shadow, at: u64) -> u32 {
+    shadow.offset(at) as u32
+}
+
+/// The bytes of a copy's raw view, from the host buffer's first byte: the
+/// title memory's end at its offset (with a bias, `len` alone cut the view
+/// `bias` bytes short of the title memory's end).
+fn view_bytes(shadow: &Shadow) -> u64 {
+    let (start, len) = shadow.span();
+    shadow.offset(start) + len
+}
 
 /// What a draw binds.
 pub(crate) struct Ready {
@@ -148,6 +168,7 @@ impl Memory {
                 "quarantine faults",
             )?,
             copies: Vec::new(),
+            generation: 0,
             dirty_pages: BTreeMap::new(),
             window_bytes: 0,
             heaps: HashMap::new(),
@@ -219,6 +240,7 @@ impl Memory {
             return self
                 .copies
                 .get(idx)
+                .and_then(|s| s.as_ref())
                 .map(|s| MapOutcome::AlreadyMapped(s.span(), idx))
                 .unwrap_or(MapOutcome::RefusedOther);
         }
@@ -270,13 +292,13 @@ impl Memory {
             return MapOutcome::RefusedOther;
         }
         let span = shadow.span();
-        let n = match self.copies.iter().position(|c| Arc::ptr_eq(c, &shadow)) {
+        let n = match self.copies.iter().position(|c| c.as_ref().is_some_and(|c| Arc::ptr_eq(c, &shadow))) {
             Some(n) => n,
             None if self.copies.len() < COPIES as usize => {
                 if !is_buffer && !reused_existing {
                     self.window_bytes = self.window_bytes.saturating_add(span.1);
                 }
-                self.copies.push(shadow.clone());
+                self.copies.push(Some(shadow.clone()));
                 let n = self.copies.len() - 1;
                 // Every page the copy holds whole, not only the one asked
                 // for: a structure is more than 64 KiB.
@@ -291,7 +313,7 @@ impl Memory {
                         // SAFETY: as above; the offset first, as below.
                         unsafe {
                             if other.read() == 0 {
-                                other.add(1).write_volatile((at - first) as u32);
+                                other.add(1).write_volatile(entry_offset(&shadow, at));
                                 other.write_volatile(n as u32 + 1);
                             }
                         }
@@ -308,14 +330,70 @@ impl Memory {
                 return MapOutcome::RefusedFull;
             }
         };
-        let offset = shadow.offset_in(start).unwrap_or(0);
+        let offset = entry_offset(&shadow, start);
         // The offset first: a shader that sees the number sees it too.
         // SAFETY: inside the directory's mapping.
         unsafe {
-            entry.add(1).write_volatile(offset as u32);
+            entry.add(1).write_volatile(offset);
             entry.write_volatile(n as u32 + 1);
         }
         MapOutcome::Mapped(span, n)
+    }
+
+    /// After buffers were retargeted (`crate::resident::retargeted`): each
+    /// numbered copy that is a buffer no table hands out any more (in a
+    /// resident replaced or gone, or a window in place a resident took
+    /// over) gets the copy handed out now under a new number, and its pages
+    /// in the directory name that one (the offset first, then the number).
+    /// The old number is not used again: lists recorded with it may still
+    /// run, and the old copy is held until they have (Stage 2 latency
+    /// plan, B1: a numbered copy kept its resident for the whole run).
+    fn retarget(&mut self) {
+        let now = crate::resident::generation();
+        if self.generation == now {
+            return;
+        }
+        self.generation = now;
+        for n in 0..self.copies.len() {
+            let Some(old) = self.copies[n].clone() else { continue };
+            let stale = old.in_resident().map_or_else(|| crate::resident::was_replaced(&old.buffer), |r| !crate::resident::registered(r));
+            if !stale {
+                continue;
+            }
+            let (first, len) = old.span();
+            let Some(new) = crate::shadow::find(first, len.max(1)).filter(|s| !Arc::ptr_eq(s, &old) && s.offset_in(first).is_some() && s.left(first) >= len) else {
+                continue;
+            };
+            let m = match self.copies.iter().position(|c| c.as_ref().is_some_and(|c| Arc::ptr_eq(c, &new))) {
+                Some(m) => m,
+                None if self.copies.len() < COPIES as usize => {
+                    self.copies.push(Some(new.clone()));
+                    self.copies.len() - 1
+                }
+                None => continue,
+            };
+            let mut at = first & !(PAGE - 1);
+            while at < first + len && at / PAGE < u64::from(MEMORY_PAGES) - 1 {
+                // SAFETY: inside the directory's mapping.
+                let entry = unsafe { self.directory.1.add((at / PAGE) as usize * 2) };
+                // SAFETY: as above; the offset first.
+                unsafe {
+                    if entry.read() == n as u32 + 1 && new.offset_in(at).is_some() {
+                        entry.add(1).write_volatile(entry_offset(&new, at));
+                        entry.write_volatile(m as u32 + 1);
+                    }
+                }
+                at += PAGE;
+            }
+            for (idx, _) in self.dirty_pages.values_mut() {
+                if *idx == n {
+                    *idx = m;
+                }
+            }
+            self.copies[n] = None;
+            crate::host::retire(old);
+            crate::resident::copy_renumbered();
+        }
     }
 
     /// The pages shaders found empty since the last frame.
@@ -467,6 +545,9 @@ pub(crate) fn ready(
             .retain(|_, (_, f)| frame.wrapping_sub(*f) <= MARK_FRAMES);
         m.take_faults();
     }
+    if crate::resident::on() {
+        m.retarget();
+    }
     let mut named = Vec::new();
     for &address in read_addresses {
         m.name_root(address, None);
@@ -507,8 +588,11 @@ pub(crate) fn ready(
         }
     };
     for (n, shadow) in m.copies.iter().enumerate().skip(made as usize) {
-        let (_, len) = shadow.span();
-        heap.raw_uav_at(base + 1 + n as u32, &shadow.buffer, 0, len);
+        match shadow {
+            Some(shadow) => heap.raw_uav_at(base + 1 + n as u32, &shadow.buffer, 0, view_bytes(shadow)),
+            // Numbered again before this heap had it: no page names it.
+            None => heap.null_raw_uav_at(base + 1 + n as u32),
+        }
     }
     m.heaps.insert(key, (base, m.copies.len() as u32));
     // Each copy once per list, whichever list numbered it: the builder alone
@@ -528,19 +612,20 @@ pub(crate) fn ready(
         if !list.first_use(READ_COPY - n) {
             break;
         }
+        let Some(shadow) = shadow else { continue };
         let (start, len) = shadow.span();
         shadow.refresh(list, start, len);
     }
     if writes {
         for &n in &named {
-            if let Some(shadow) = m.copies.get(n)
+            if let Some(shadow) = m.copies.get(n).and_then(|s| s.as_ref())
                 && list.first_use(WRITE_COPY - n)
             {
                 let (start, len) = shadow.span();
                 shadow.gpu_writes(list, start, len);
             }
         }
-        let spans: Vec<(u64, u64)> = m.copies.iter().map(|s| s.span()).collect();
+        let spans: Vec<(u64, u64)> = m.copies.iter().map(|s| s.as_ref().map_or((0, 0), |s| s.span())).collect();
         let dirty: Vec<(u32, usize)> = m
             .dirty_pages
             .iter()
@@ -553,7 +638,9 @@ pub(crate) fn ready(
             })
             .collect();
         for (idx, run_start, run_len) in coalesce_dirty_runs(dirty, &spans) {
-            m.copies[idx].gpu_writes(list, run_start, run_len);
+            if let Some(shadow) = &m.copies[idx] {
+                shadow.gpu_writes(list, run_start, run_len);
+            }
         }
         list.mark_uav_dirty();
         list.mark_memory_dirty();
@@ -673,5 +760,49 @@ mod tests {
                 (1, u64::from(b1 + 2) * PAGE, 2 * PAGE),
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod inplace_tests {
+    use super::{PAGE, entry_offset, view_bytes};
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::core::Interface;
+    use windows_sys::Win32::System::Memory as mem;
+
+    /// Design §11, bug 1: a raw address reaches the title's byte in a copy
+    /// in place, whose buffer begins `bias` bytes before the title memory;
+    /// and the copy's view reaches its last byte. The software adapter
+    /// reads what the directory's offset names.
+    #[test]
+    fn warp_raw_addresses_into_memory_in_place_take_the_bias() {
+        let Some(device) = crate::inplace::tests::warp() else { return };
+        if device.cast::<ID3D12Device13>().is_err() {
+            return;
+        }
+        // SAFETY: an allocation of the test's own.
+        unsafe {
+            let base = mem::VirtualAlloc(std::ptr::null(), 8 << 16, mem::MEM_RESERVE | mem::MEM_COMMIT, mem::PAGE_READWRITE).cast::<u8>();
+            let (start, len) = (base as u64 + 0x1230, 3 * PAGE + 0x40);
+            for i in 0..len as usize {
+                base.add(0x1230 + i).write((i as u8).wrapping_mul(13).wrapping_add(i as u8 >> 3));
+            }
+            let placed = crate::inplace::place_part(&device, start, len).unwrap();
+            let bias = placed.bias;
+            assert_eq!(bias, 0x1230);
+            let shadow = crate::shadow::Shadow::test_in_place(placed, start, len);
+            // The first whole directory page in the copy.
+            let page = start.next_multiple_of(PAGE);
+            let offset = entry_offset(&shadow, page);
+            assert_eq!(u64::from(offset), page - start + bias, "the offset from the buffer's first byte");
+            assert_eq!(view_bytes(&shadow), len + bias, "the view reaches the title memory's end");
+            let mut rig = crate::inplace::Rig::new(&device).unwrap();
+            let got = rig.fetch(&shadow.buffer, u64::from(offset), 4096).unwrap();
+            assert_eq!(got, std::slice::from_raw_parts(page as *const u8, 4096), "the page's own bytes");
+            let last = rig.fetch(&shadow.buffer, view_bytes(&shadow) - 16, 16).unwrap();
+            assert_eq!(last, std::slice::from_raw_parts((start + len - 16) as *const u8, 16), "the last bytes are in the view");
+            drop(shadow);
+            mem::VirtualFree(base.cast(), 0, mem::MEM_RELEASE);
+        }
     }
 }
