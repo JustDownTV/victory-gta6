@@ -984,6 +984,23 @@ pub(super) fn with_first_half_pairs<R>(translate: impl FnOnce() -> R) -> R {
     result
 }
 
+thread_local! {
+    /// Whether constant samplers that meet at a join take the first path's
+    /// ([`with_first_path_samplers`]).
+    static FIRST_PATH_SAMPLERS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `translate` with constant samplers that meet at a join and differ
+/// only in their address modes taken as the first path's ([`Lower::handle`]):
+/// for a program refused with [`CHOSEN`] whose blocks copied for each way in
+/// do not translate either.
+pub(super) fn with_first_path_samplers<R>(translate: impl FnOnce() -> R) -> R {
+    let before = FIRST_PATH_SAMPLERS.replace(true);
+    let result = translate();
+    FIRST_PATH_SAMPLERS.set(before);
+    result
+}
+
 pub(super) fn host_max_wave() -> u32 {
     #[cfg(test)]
     if let Some(lanes) = TEST_HOST_WAVE.get() {
@@ -6345,8 +6362,9 @@ impl<'a> Lower<'a> {
         // the first path's static sampler.
         // shortcut: on the other paths the texture's edges then repeat or
         // clamp as the first path's do; words that differ in anything else
-        // still stop the program.
-        if sampler && matches!(src, Source::Phi { .. } | Source::Select { .. }) {
+        // still stop the program. Only once the blocks copied for each way in
+        // ([`super::split_choices`]) did not translate.
+        if sampler && FIRST_PATH_SAMPLERS.get() && matches!(src, Source::Phi { .. } | Source::Select { .. }) {
             let leaves = src.leaves();
             if let Some(&Source::Constant(ref words)) = leaves.first().copied()
                 && leaves.iter().all(|l| {

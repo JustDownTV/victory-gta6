@@ -773,7 +773,11 @@ fn emit_forms(
     // with that block copied for each way in ([`split_choices`]).
     let original = match original {
         Err(ShaderError::Unsupported { what, .. }) if what == lower::CHOSEN => {
-            split_choices(c, native, p, res).unwrap_or(original)
+            // (failing that, constant samplers that differ only in address modes take the
+            // first path's: `lower::with_first_path_samplers`)
+            split_choices(c, native, p, res).unwrap_or_else(|| {
+                lower::with_first_path_samplers(|| emit_program(c, native, p, st, io, res))
+            })
         }
         other => other,
     };
