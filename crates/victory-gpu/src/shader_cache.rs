@@ -158,19 +158,18 @@ fn program_hash(container: &[u8]) -> String {
 
 /// The translation of the container whose hash is `hash`.
 fn translate(hash: &str, container: &[u8]) -> Result<HostShader, String> {
-    // (DexNom's translator has no per-program switches: the hash only
-    // names the program in the log.)
-    let _ = hash;
-    victory_shader::emit::translate(container).map_err(|e| e.to_string())
+    use victory_shader::emit;
+    emit::for_program(hash, || emit::translate(container)).map_err(|e| e.to_string())
 }
 
 /// The key the translation of `container` is filed under: the build's
 /// ([`build`]), with this program's own decisions ([`program_key`]).
 fn key(hash: &str, container: &[u8]) -> [u8; 32] {
-    // (DexNom's translator has no per-program lists: every program keeps
-    // the build's key.)
-    let _ = (hash, container);
-    program_key(&build(), false)
+    use victory_shader::emit;
+    // (`wave64_retried` second: it parses the container, and only a program
+    // a list names, or with `VICTORY_WAVE_DEEP_SKIPS=0` any, gets there)
+    let deep_skips_off = !emit::deep_skips_allowed(Some(hash)) && emit::wave64_retried(container);
+    program_key(&build(), deep_skips_off)
 }
 
 /// The key of one program's entries: the build's, mixed with the

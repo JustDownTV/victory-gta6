@@ -94,6 +94,8 @@ mod intersect_tests;
 pub mod host;
 mod lower;
 mod own_bits;
+mod per_program;
+pub use per_program::{deep_skips_allowed, for_program, wave64_retried};
 mod rect;
 mod sampler;
 mod shader;
@@ -437,7 +439,9 @@ pub fn emit(
                 // ([`ir::without_skips`], `deep`): most of the body is then code every
                 // lane runs, where the two host waves can exchange.
                 // (`VICTORY_WAVE_DEEP_SKIPS=0` and `VICTORY_WAVE_WIDE=0` turn the two off.)
-                let deep_on = std::env::var_os("VICTORY_WAVE_DEEP_SKIPS").is_none_or(|v| v != "0");
+                // Per program (`VICTORY_WAVE_DEEP_SKIPS_NOT` / `_ONLY`, ours):
+                // [`deep_skips_allowed`] on the hash [`for_program`] set.
+                let deep_on = deep_skips_allowed(per_program::current().as_deref());
                 let deep = if deep_on { form(ir::without_skips(p, true)) } else { None };
                 if let Some((p, st, io, res)) = &deep {
                     let again = emit_program(c, native, p, st, io, res);
