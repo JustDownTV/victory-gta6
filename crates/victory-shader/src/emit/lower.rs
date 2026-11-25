@@ -6021,6 +6021,29 @@ impl<'a> Lower<'a> {
         sampler: bool,
         props: (u32, u32),
     ) -> Result<V, Why> {
+        // A sampler the program builds from constant words on every path that
+        // reaches a join (`PS_TexturedDeferred`, `PS_TexturedLit`: one set
+        // before a loop, another on the way past it): a constant has no heap
+        // index to pick per path, and static samplers are bound one by one.
+        // Words that differ only in the address modes (word 0, bits 0-8) are
+        // the first path's static sampler.
+        // shortcut: on the other paths the texture's edges then repeat or
+        // clamp as the first path's do; words that differ in anything else
+        // still stop the program.
+        if sampler && matches!(src, Source::Phi { .. } | Source::Select { .. }) {
+            let leaves = src.leaves();
+            if let Some(&Source::Constant(ref words)) = leaves.first().copied()
+                && leaves.iter().all(|l| {
+                    matches!(l, Source::Constant(w) if w.len() == words.len()
+                        && w.iter().zip(words.iter()).enumerate().all(|(k, (a, b))| {
+                            let modes = if k == 0 { 0x1FF } else { 0 };
+                            a & !modes == b & !modes
+                        }))
+                })
+            {
+                return self.handle(site, &Source::Constant(words.clone()), sampler, props);
+            }
+        }
         match src {
             Source::Loaded { load, first } => {
                 let key = (self.cur, *load, *first, sampler, props);
