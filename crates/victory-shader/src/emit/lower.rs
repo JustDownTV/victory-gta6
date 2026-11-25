@@ -439,6 +439,16 @@ pub(super) fn needs_every_lane(what: &str) -> bool {
     what.ends_with("where not every lane runs") || what == MASK_ELSEWHERE
 }
 
+/// What stopped the last lowering on this thread with [`LONE_FIRST_HALF`]:
+/// the first half of an interpolation whose result the program needs
+/// itself (not only its second half), which it forgets.
+pub(super) const LONE_FIRST_HALF_WHY: Why = "the first half of an interpolation";
+
+/// See [`LONE_FIRST_HALF_WHY`].
+pub(super) fn take_lone_first_half() -> Option<Site> {
+    LONE_FIRST_HALF.take()
+}
+
 /// The blocks where the last lowering on this thread wanted every lane and did not have it
 /// (its "... where not every lane runs" refusals), which it forgets.
 pub(super) fn take_needs() -> Vec<usize> {
@@ -952,6 +962,8 @@ pub fn set_host_max_wave(lanes: u32) {
 thread_local! {
     /// See [`take_needs`].
     static NEEDS: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// See [`take_lone_first_half`].
+    static LONE_FIRST_HALF: std::cell::Cell<Option<Site>> = const { std::cell::Cell::new(None) };
     /// See [`with_local_waves`].
     static LOCAL_WAVES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// See [`with_local_waves_any`].
@@ -8727,7 +8739,8 @@ impl<'a> Lower<'a> {
 
     fn interp(&mut self, inst: &Inst, site: Site) -> Result<(), Why> {
         let Some(&interp) = self.interps.get(&site) else {
-            return Err("the first half of an interpolation");
+            LONE_FIRST_HALF.set(Some(site));
+            return Err(LONE_FIRST_HALF_WHY);
         };
         let name = inst.name();
         let (dst, src) = match &inst.fields {

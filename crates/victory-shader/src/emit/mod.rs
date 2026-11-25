@@ -308,7 +308,36 @@ pub fn emit(
 ) -> Result<HostShader, ShaderError> {
     // (what an earlier program's lowering on this thread left behind)
     lower::take_needs();
-    let original = emit_program(c, native, p, st, io, res);
+    lower::take_lone_first_half();
+    #[allow(unused_mut)]
+    let mut original = emit_program(c, native, p, st, io, res);
+    // A pixel program that needs the result of an interpolation's first half
+    // itself, not only its second half (a `v_fma_mix` of the partial sum, or
+    // the half a 16-bit second half keeps of its old destination): once more
+    // with that first half evaluating on its own (`Interp::Weighted`), which
+    // reads its attribute row per vertex. Only programs that stop on it are
+    // tried again; 8 of the pack (`PS_DeferredTextured`,
+    // `PS_MirrorReflectionDeferredDecalTextured`).
+    if native.stage == HwStage::Ps {
+        let mut weighted: Option<io::Io> = None;
+        for _ in 0..64 {
+            let lone = matches!(&original, Err(ShaderError::Unsupported { what, .. }) if *what == lower::LONE_FIRST_HALF_WHY);
+            let Some(site) = lone.then(lower::take_lone_first_half).flatten() else {
+                break;
+            };
+            let mut next = weighted.clone().unwrap_or_else(|| io.clone());
+            let attribute = next.interps.iter().find_map(|(_, i)| match i {
+                io::Interp::Interpolated { attribute, first, .. } if first.contains(&site) => Some(*attribute),
+                _ => None,
+            });
+            let Some(attribute) = attribute.filter(|_| !next.interps.iter().any(|(s, _)| *s == site)) else {
+                break;
+            };
+            next.interps.push((site, io::Interp::Weighted { attribute }));
+            original = emit_program(c, native, p, st, &next, res);
+            weighted = Some(next);
+        }
+    }
     // A console wave64 compute program on a host of 32-lane waves that
     // still needs 64 lanes, or whose cross-lane code sits where not every
     // lane runs: once more with its early-outs left out
