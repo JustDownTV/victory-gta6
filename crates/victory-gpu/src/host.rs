@@ -2652,7 +2652,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                         // buffer of its own, four a frame, 43 to 60 ms a
                         // frame) and neither side had other bytes after
                         // one. A copy INTO such a range still waits.
-                        if !touches(written, dst, dst + len) && fill_ahead::on() {
+                        if !touches(written, dst, dst + len) && fill_ahead::on(src, len) {
                             if count {
                                 fill_ahead::read(src, len);
                             }
@@ -2670,7 +2670,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                     if touches(written, src, src + len) {
                         // Not waited for, and checked when the flights land
                         // (`fill_ahead`).
-                        if fill_ahead::on() {
+                        if fill_ahead::on(src, len) {
                             if count {
                                 fill_ahead::read(src, len);
                             }
@@ -2723,6 +2723,13 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
 /// lands (the bytes going into title memory are compared with the ones
 /// there, over every fill that read ahead of them) and from then on fills
 /// wait as before. `VICTORY_FILL_WAIT=1`: they wait from the start.
+///
+/// The waiting it turns back on is for the 64 KiB of title memory the
+/// missed fill read, not for every fill: one miss while the world loaded
+/// (frame 1244 of a run of 25/11) had every fill of the rest of the run
+/// wait, 1.2 waits and 42 ms a frame. Past `HOT_MAX` such pieces, every
+/// fill waits as before. `VICTORY_FILL_WAIT_ALL=1`: the first miss has
+/// every fill wait, as before.
 mod fill_ahead {
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
@@ -2737,6 +2744,11 @@ mod fill_ahead {
 
     /// A flight changed bytes a fill had read ahead of it: fills wait.
     static WAIT: AtomicBool = AtomicBool::new(false);
+    /// The 64 KiB pieces where a flight changed bytes a fill had read ahead
+    /// of it: fills that read there wait.
+    static HOT: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+    /// Pieces kept in `HOT` before every fill waits.
+    const HOT_MAX: usize = 32;
     /// Since the last frame line: fills that read ahead; landings' writes
     /// that touched one's piece. Since the start: fills that read bytes a
     /// flight then changed.
@@ -2765,9 +2777,31 @@ mod fill_ahead {
 
     static READ: Mutex<Option<HashMap<usize, Piece>>> = Mutex::new(None);
 
-    pub(super) fn on() -> bool {
+    /// Whether a fill (or copy) reading `len` bytes at `src` may read ahead
+    /// of the flights.
+    pub(super) fn on(src: usize, len: usize) -> bool {
         static ON: OnceLock<bool> = OnceLock::new();
-        *ON.get_or_init(|| std::env::var_os("VICTORY_FILL_WAIT").is_none_or(|v| v != "1")) && !WAIT.load(Relaxed)
+        if !*ON.get_or_init(|| std::env::var_os("VICTORY_FILL_WAIT").is_none_or(|v| v != "1")) || WAIT.load(Relaxed) {
+            return false;
+        }
+        let hot = HOT.lock().unwrap_or_else(|e| e.into_inner());
+        hot.is_empty() || !hot_touches(&hot, src, len)
+    }
+
+    /// Whether `[src, src + len)` touches one of the pieces of `hot`. Pure, for testing.
+    fn hot_touches(hot: &[usize], src: usize, len: usize) -> bool {
+        len > 0 && (src / PIECE..=(src + len - 1) / PIECE).any(|p| hot.contains(&p))
+    }
+
+    /// The pieces `[from, to)` become hot; whether every fill waits now
+    /// (more than `HOT_MAX` pieces). Pure on `hot`, for testing.
+    fn heat(hot: &mut Vec<usize>, from: usize, to: usize) -> bool {
+        for p in from / PIECE..=(to.max(from + 1) - 1) / PIECE {
+            if !hot.contains(&p) {
+                hot.push(p);
+            }
+        }
+        hot.len() > HOT_MAX
     }
 
     /// A fill reads `len` bytes at `src` ahead of flights that may write
@@ -2825,6 +2859,22 @@ mod fill_ahead {
             }
             let n = COUNT[2].fetch_add(1, Relaxed) + 1;
             let first = now.iter().zip(&new[a - at..b - at]).position(|(x, y)| x != y).unwrap_or(0);
+            static ALL: OnceLock<bool> = OnceLock::new();
+            let all = *ALL.get_or_init(|| std::env::var_os("VICTORY_FILL_WAIT_ALL").is_some_and(|v| v == "1"));
+            if !all {
+                let mut hot = HOT.lock().unwrap_or_else(|e| e.into_inner());
+                let full = heat(&mut hot, from, to);
+                let pieces = hot.len();
+                drop(hot);
+                if !full {
+                    tracing::warn!(
+                        "a fill of upload memory read {} bytes at {from:#x} in frame {read_in} ahead of a flight whose shaders                          changed them (first at {:#x}, landed in frame {frame}): the lists of that submission drew with the bytes                          from before. Fills that read those 64 KiB wait for flights from here on ({n} such fills, {pieces} pieces                          waited for)",
+                        to - from,
+                        a + first
+                    );
+                    continue;
+                }
+            }
             if !WAIT.swap(true, Relaxed) {
                 tracing::warn!(
                     "a fill of upload memory read {} bytes at {from:#x} in frame {read_in} ahead of a flight whose shaders changed \
@@ -2864,6 +2914,35 @@ mod fill_ahead {
             COUNT[2].load(Relaxed),
             if WAIT.load(Relaxed) { " (fills wait again)" } else { "" }
         );
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn a_miss_heats_only_the_pieces_it_read() {
+            let mut hot = Vec::new();
+            assert!(!hot_touches(&hot, 0x1234, 16));
+            assert!(!heat(&mut hot, 0x2_fff0, 0x3_0010), "two pieces, far from the limit");
+            assert_eq!(hot, vec![2, 3]);
+            assert!(hot_touches(&hot, 0x2_0000, 1));
+            assert!(hot_touches(&hot, 0x1_fff0, 0x20), "reaches into piece 2");
+            assert!(!hot_touches(&hot, 0x1_fff0, 0x10), "ends where piece 2 begins");
+            assert!(!hot_touches(&hot, 0x4_0000, 0x100));
+            assert!(!hot_touches(&hot, 0x2_0000, 0), "an empty read touches nothing");
+            assert!(!heat(&mut hot, 0x2_0000, 0x2_0004), "already hot");
+            assert_eq!(hot.len(), 2);
+        }
+
+        #[test]
+        fn past_the_limit_every_fill_waits() {
+            let mut hot = Vec::new();
+            for i in 0..HOT_MAX {
+                assert!(!heat(&mut hot, i * 2 * PIECE, i * 2 * PIECE + 4), "{i}");
+            }
+            assert!(heat(&mut hot, 1 << 40, (1 << 40) + 4));
+        }
     }
 }
 
