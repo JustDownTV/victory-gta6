@@ -421,6 +421,32 @@ fn emit_once(
             ("without early-outs", form(ir::without_early_outs(p))),
             ("without skips", form(ir::without_skips(p, false))),
         ];
+        // Each host wave on its own where that is exact (the allocation idiom: one atomic
+        // per wave and the lanes' prefix), before the forms that exchange between the two
+        // host waves through LDS at group barriers: the light-probe allocation program
+        // (`CS_Primary_RegisterAllocationRequests`) took its exchanging form, 34 barriers,
+        // 5.5 ms a frame on a 32-lane card. `VICTORY_WAVE_IDIOM_FIRST=0`: the order before.
+        let idiom_first = std::env::var_os("VICTORY_WAVE_IDIOM_FIRST").is_none_or(|v| v != "0");
+        if idiom_first && local_on && !exact_only {
+            if idiom(p, st) {
+                let local = lower::with_local_waves(|| emit_program(c, native, p, st, io, res));
+                report("local waves (idiom), first", &local);
+                if done(&local) {
+                    return local.map(|(shader, _)| shader);
+                }
+            }
+            for (name, f) in &forms {
+                if let Some((p, st, io, res)) = f
+                    && idiom(p, st)
+                {
+                    let local = lower::with_local_waves(|| emit_program(c, native, p, st, io, res));
+                    report(&format!("local waves (idiom), first, {name}"), &local);
+                    if done(&local) {
+                        return local.map(|(shader, _)| shader);
+                    }
+                }
+            }
+        }
         for (name, f) in &forms {
             if let Some((p, st, io, res)) = f {
                 let again = emit_program(c, native, p, st, io, res);
