@@ -5,7 +5,7 @@
 //! (unless `VICTORY_LATE_WAIT=1`, see [`late`]);
 //! overlap them with per-submission fences once more than clears run.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -804,6 +804,10 @@ pub(crate) struct HostList {
     indirect_args: Mutex<Option<(ID3D12Resource, u64)>>,
     /// The buffers of `crate::indirect::window_check`, made at its first use.
     window_check: OnceLock<Option<crate::indirect::WindowCheck>>,
+    /// Whether a UAV-writing dispatch, storing draw, or copy may have run
+    /// since the last global UAV barrier on this list (starts true to order
+    /// writes from earlier command lists).
+    uav_dirty: AtomicBool,
     /// Counts the list in [`ALIVE`] while it lives.
     _alive: Counted,
     /// The texts of the markers `note_op` set, in order (for device-removed
@@ -1615,11 +1619,10 @@ unsafe impl Send for CardWork {}
 static CARD_WORK: Mutex<Option<CardWork>> = Mutex::new(None);
 
 /// The compare of a declared range of a copy in the card's memory with
-/// its bytes from before, one thread per 64 KiB piece (cut at multiples of
-/// 64 KiB of title memory, as `Shadow::card_piece` cuts them): `differs`
-/// gets a dword per piece, 1 where a byte differs. The offsets are widened
-/// to 16 bytes; buffers are multiples of 64 KiB, and a piece flagged for a
-/// byte just outside the range costs a fetch that finds nothing.
+/// its bytes from before, one 64-thread group per 64 KiB piece (cut at
+/// multiples of 64 KiB of title memory, as `Shadow::card_piece` cuts them):
+/// `differs` gets a dword per piece, 1 where a byte differs. Coalesced
+/// 1,024-byte bursts across the 64 threads with a groupshared reduction.
 pub(crate) const CARD_COMPARE: &str = r#"
 #define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), UAV(u0), UAV(u1)"
 cbuffer Span : register(b0) {
@@ -1635,29 +1638,47 @@ ByteAddressBuffer now : register(t0);
 // last sent up (or hashed whole, the first time).
 RWByteAddressBuffer hashes : register(u0);
 RWByteAddressBuffer differs : register(u1);
+groupshared uint4 partial[64];
 [RootSignature(RS)]
 [numthreads(64, 1, 1)]
-void main(uint3 id : SV_DispatchThreadID) {
-    if (id.x >= pieces) return;
-    uint piece = first + id.x;
-    uint lo = piece * 65536u;
-    lo = lo > skew ? lo - skew : 0u;
-    uint hi = min((piece + 1u) * 65536u - skew, size);
-    lo = lo & ~15u;
-    hi = (hi + 15u) & ~15u;
-    uint4 h = uint4(0x9E3779B9u, 0x85EBCA6Bu, 0xC2B2AE35u, 0x27D4EB2Fu);
+void main(uint3 group : SV_GroupID, uint t : SV_GroupIndex) {
     [loop]
-    for (uint at = lo; at < hi; at += 16u) {
-        h = (h ^ now.Load4(at)) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
-        h = h.yzwx ^ (h >> 15);
-    }
-    if (compare != 0u) {
-        differs.Store(out_at + id.x * 4u, any(h != hashes.Load4(piece * 16u)) ? 1u : 0u);
-        // With the copy-back on its own thread: the next compare of the
-        // piece finds what is written from here on.
-        if (compare == 2u) hashes.Store4(piece * 16u, h);
-    } else {
-        hashes.Store4(piece * 16u, h);
+    for (uint idx = group.x; idx < pieces; idx += 65535u) {
+        uint piece = first + idx;
+        uint lo = piece * 65536u;
+        lo = lo > skew ? lo - skew : 0u;
+        uint hi = min((piece + 1u) * 65536u - skew, size);
+        lo = lo & ~15u;
+        hi = (hi + 15u) & ~15u;
+        uint4 h = uint4(0x9E3779B9u, 0x85EBCA6Bu, 0xC2B2AE35u, 0x27D4EB2Fu) ^ (t * 0x9E3779B1u);
+        [loop]
+        for (uint at = lo + t * 16u; at < hi; at += 1024u) {
+            h = (h ^ now.Load4(at)) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
+            h = h.yzwx ^ (h >> 15);
+        }
+        partial[t] = h;
+        GroupMemoryBarrierWithGroupSync();
+        [unroll]
+        for (uint s = 32u; s > 0u; s >>= 1u) {
+            if (t < s) {
+                uint4 o = partial[t + s];
+                uint4 m = (partial[t] ^ o) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
+                partial[t] = m.yzwx ^ (m >> 15);
+            }
+            GroupMemoryBarrierWithGroupSync();
+        }
+        if (t == 0u) {
+            uint4 final_h = partial[0];
+            if (compare != 0u) {
+                differs.Store(out_at + idx * 4u, any(final_h != hashes.Load4(piece * 16u)) ? 1u : 0u);
+                // With the copy-back on its own thread: the next compare of the
+                // piece finds what is written from here on.
+                if (compare == 2u) hashes.Store4(piece * 16u, final_h);
+            } else {
+                hashes.Store4(piece * 16u, final_h);
+            }
+        }
+        GroupMemoryBarrierWithGroupSync();
     }
 }
 "#;
@@ -1727,8 +1748,8 @@ void main(uint3 group : SV_GroupID, uint t : SV_GroupIndex) {
 "#;
 
 /// Whether the pieces a flight's compare flags come down to the PC inside
-/// the flight itself (`VICTORY_CARD_FETCH_INFLIGHT=1`; off by default, and
-/// only with [`relay`]).
+/// the flight itself (`VICTORY_CARD_FETCH_INFLIGHT=0` to disable; on by
+/// default with [`relay`]).
 ///
 /// With the relay the thread that lands flights fetched the flagged pieces
 /// with a list of its own on the host's queue, the one the submitting
@@ -1748,7 +1769,7 @@ void main(uint3 group : SV_GroupID, uint t : SV_GroupIndex) {
 /// exact and when a landing falls back to the old fetch.
 fn inflight_fetch() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| relay() && std::env::var_os("VICTORY_CARD_FETCH_INFLIGHT").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| relay() && std::env::var_os("VICTORY_CARD_FETCH_INFLIGHT").is_none_or(|v| v != "0"))
 }
 
 /// The bytes of the PC's memory pieces fetched inside flights go to
@@ -1870,7 +1891,7 @@ void main(uint3 group : SV_GroupID, uint t : SV_GroupIndex) {
 /// Whether the passes over copies in the card's memory hash with a group
 /// per piece ([`CARD_COMPARE_WIDE`]), and those before a submission's lists
 /// come after all its copies, behind one barrier (`VICTORY_CARD_HASH_WIDE=0`:
-/// a thread per piece, copies and passes in turn, as before).
+/// [`CARD_COMPARE`], also a group per piece, with copies and passes in turn).
 fn hash_wide() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_HASH_WIDE").is_none_or(|v| v != "0"))
@@ -1878,12 +1899,12 @@ fn hash_wide() -> bool {
 
 /// The groups that hash `pieces` pieces.
 fn hash_groups(pieces: u32) -> u32 {
-    if hash_wide() { pieces } else { pieces.div_ceil(64) }
+    if hash_wide() { pieces } else { pieces.min(65535) }
 }
 
 /// Whether the pieces hashed again after ranges were sent up to a copy in
 /// the card's memory are hashed in runs of pieces that touch, each piece
-/// once (`VICTORY_CARD_REHASH_RUNS=1`; off by default), and not in a pass
+/// once (`VICTORY_CARD_REHASH_RUNS=0` to disable; on by default), and not in a pass
 /// per range sent up.
 ///
 /// These passes are ours, they run on the card before every submission's
@@ -1895,7 +1916,7 @@ fn hash_groups(pieces: u32) -> u32 {
 /// a fetch that finds nothing and loses no shader write.
 fn rehash_runs() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_REHASH_RUNS").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_REHASH_RUNS").is_none_or(|v| v != "0"))
 }
 
 /// Since the last frame-rate line, of our own passes over copies in the
@@ -3888,6 +3909,7 @@ impl Host {
                 card_budget: OnceLock::new(),
                 indirect_args: Mutex::default(),
                 window_check: OnceLock::new(),
+                uav_dirty: AtomicBool::new(true),
                 _alive: Counted::new(),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
@@ -4322,6 +4344,9 @@ impl Host {
                         CARD_PASSES[0].fetch_add(runs.len() as u64, Ordering::Relaxed);
                         CARD_PASSES[1].fetch_add(runs.iter().map(|r| u64::from(r.pieces)).sum::<u64>(), Ordering::Relaxed);
                         for run in runs {
+                            if run.pieces == 0 {
+                                continue;
+                            }
                             let constants = [run.first, run.skew, size as u32, run.pieces, 0, 0];
                             list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
                             list.Dispatch(hash_groups(run.pieces), 1, 1);
@@ -4406,6 +4431,9 @@ impl Host {
                     list.SetPipelineState(&work.pso);
                     list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
                     for r in plan.ranges.iter().filter(|r| r.compared) {
+                        if r.span.pieces == 0 {
+                            continue;
+                        }
                         let Some((_, Some(before), size)) = r.shadow.card_sides() else {
                             continue;
                         };
@@ -4955,15 +4983,62 @@ impl Host {
         }
         // Outside the lock: no slot of these plans is written over before
         // their tickets are landed (`inflight_tickets_landed`, after this).
-        let mut title = Vec::new();
-        let (mut written, mut bytes) = (0, 0u64);
-        for (shadow, lo, hi, at, after) in &pieces {
-            // SAFETY: inside the mapping of the slots (checked above); the
-            // copy into it ran in the plan's flight, which the card has run.
-            let gpu = unsafe { std::slice::from_raw_parts(*at as *const u8, hi - lo) };
-            written += shadow.card_merge_relay(*lo, gpu, *after, &mut title);
-            bytes += (hi - lo) as u64;
-        }
+        let piece_count = pieces.len() as u64;
+        let bytes: u64 = pieces.iter().map(|p| (p.2 - p.1) as u64).sum();
+        let written = if wide_merge() && pieces.len() >= 4 {
+            // Group pieces by shadow while preserving exact plan order within
+            // each shadow, then balance shadow groups across up to 8 workers.
+            let mut by_shadow: std::collections::HashMap<usize, Vec<Piece>> = std::collections::HashMap::new();
+            for item in pieces {
+                by_shadow.entry(Arc::as_ptr(&item.0) as usize).or_default().push(item);
+            }
+            let mut groups: Vec<Vec<Piece>> = by_shadow.into_values().collect();
+            let buckets = groups.len().min(8);
+            let mut shards: Vec<Vec<Piece>> = (0..buckets).map(|_| Vec::new()).collect();
+            let mut shard_bytes = vec![0usize; buckets];
+            groups.sort_unstable_by_key(|g| std::cmp::Reverse(g.iter().map(|x| x.2 - x.1).sum::<usize>()));
+            for group in groups {
+                let gbytes: usize = group.iter().map(|x| x.2 - x.1).sum();
+                let idx = shard_bytes
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|&(_, &b)| b)
+                    .map_or(0, |(i, _)| i);
+                shard_bytes[idx] += gbytes;
+                shards[idx].extend(group);
+            }
+            let written_total = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let jobs: Vec<Box<dyn FnOnce() + Send>> = shards
+                .into_iter()
+                .filter(|s| !s.is_empty())
+                .map(|shard| {
+                    let written_total = written_total.clone();
+                    Box::new(move || {
+                        let mut title = Vec::new();
+                        let mut local = 0usize;
+                        for (shadow, lo, hi, at, after) in shard {
+                            // SAFETY: inside the mapping of the slots; `wide_run`
+                            // waits for this job before tickets are landed.
+                            let gpu = unsafe { std::slice::from_raw_parts(at as *const u8, hi - lo) };
+                            local += shadow.card_merge_relay(lo, gpu, after, &mut title);
+                        }
+                        written_total.fetch_add(local, Ordering::Relaxed);
+                    }) as Box<dyn FnOnce() + Send>
+                })
+                .collect();
+            crate::shadow::wide_run(jobs);
+            written_total.load(Ordering::Relaxed)
+        } else {
+            let mut title = Vec::new();
+            let mut written = 0;
+            for (shadow, lo, hi, at, after) in &pieces {
+                // SAFETY: inside the mapping of the slots (checked above); the
+                // copy into it ran in the plan's flight, which the card has run.
+                let gpu = unsafe { std::slice::from_raw_parts(*at as *const u8, hi - lo) };
+                written += shadow.card_merge_relay(*lo, gpu, *after, &mut title);
+            }
+            written
+        };
         for plan in plans {
             for r in &plan.ranges {
                 crate::shadow::CARD_STATS[2].fetch_add(u64::from(r.span.pieces), Ordering::Relaxed);
@@ -4971,7 +5046,7 @@ impl Host {
             }
         }
         COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
-        INFLIGHT_STATS[0].fetch_add(pieces.len() as u64, Ordering::Relaxed);
+        INFLIGHT_STATS[0].fetch_add(piece_count, Ordering::Relaxed);
         INFLIGHT_STATS[1].fetch_add(bytes, Ordering::Relaxed);
         // The next merge is of a later plan, or a fetch the old way sent now.
         if let Some(last) = plans.iter().map(|p| p.sent_as).max() {
@@ -6148,6 +6223,7 @@ impl HostList {
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.uav_dirty.store(true, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
         {
@@ -6883,6 +6959,22 @@ impl HostList {
     /// The list's buffers for `crate::indirect::window_check`.
     pub(crate) fn window_check(&self) -> Option<&crate::indirect::WindowCheck> {
         self.window_check.get_or_init(crate::indirect::WindowCheck::new).as_ref()
+    }
+
+    /// Records that a UAV-writing command may have run on this list.
+    pub(crate) fn mark_uav_dirty(&self) {
+        self.uav_dirty.store(true, Ordering::Relaxed);
+    }
+
+    /// Clears the UAV-dirty flag (after a global UAV barrier has been emitted).
+    pub(crate) fn clear_uav_dirty(&self) {
+        self.uav_dirty.store(false, Ordering::Relaxed);
+    }
+
+    /// Returns true if a UAV write may have occurred since the last global UAV
+    /// barrier, and clears the flag.
+    pub(crate) fn take_uav_dirty(&self) -> bool {
+        self.uav_dirty.swap(false, Ordering::Relaxed)
     }
 
     /// Keeps `object` alive until the list is reset.

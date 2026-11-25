@@ -761,8 +761,11 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
             b.kind != 1 && !b.first.is_null() && crate::resource::buffer_bytes(b.first).is_some()
         }) {
             host.push(UAV_BARRIER);
+            list.clear_uav_dirty();
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::WaitsForBuffers, 1);
+        } else if host.iter().any(|b| b.kind == 2 && b.first.is_null()) {
+            list.clear_uav_dirty();
         }
         if !host.is_empty() {
             use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
@@ -826,6 +829,7 @@ extern "system" fn copy_buffer_region(
         && let Some(to) = buffer_range(dst, dst_offset, len)
         && let Some(from) = buffer_range(src, src_offset, len)
     {
+        list.mark_uav_dirty();
         list.defer_copy(to, from, len as usize);
     }
     #[cfg(not(windows))]
@@ -882,6 +886,7 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::resource::buffer_bytes(dst),
             crate::resource::buffer_bytes(src),
         ) {
+            list.mark_uav_dirty();
             list.defer_copy(to, from, a.min(b) as usize);
         }
     }
@@ -1947,18 +1952,21 @@ extern "system" fn wait_value64(this: This, address: u64, comparison: u32, refer
 /// first, so only their ordering matters: one barrier on every shader
 /// write (the title's buffer barriers order compute passes).
 extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
-    // Diagnostics: counted, and left out under `VICTORY_BARRIER_TEST=groups`.
-    #[cfg(all(windows, feature = "diagnostics"))]
-    if count > 0 {
-        crate::copystat::add(crate::copystat::C::WaitsForGroups, 1);
-        if crate::copystat::barrier_test() & 1 != 0 {
-            return;
-        }
-    }
     #[cfg(windows)]
     if count > 0
         && let Some(list) = host_list(this)
     {
+        if !list.take_uav_dirty() {
+            return;
+        }
+        // Diagnostics: counted, and left out under `VICTORY_BARRIER_TEST=groups`.
+        #[cfg(feature = "diagnostics")]
+        {
+            crate::copystat::add(crate::copystat::C::WaitsForGroups, 1);
+            if crate::copystat::barrier_test() & 1 != 0 {
+                return;
+            }
+        }
         use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
         // SAFETY: the same layout; no resource named.
         let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };

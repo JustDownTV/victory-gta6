@@ -137,7 +137,7 @@ struct Window {
 }
 
 /// The most records clamped in one pass ([`windows`]).
-const WINDOW_MOST: u64 = 64;
+const WINDOW_MOST: u64 = 256;
 
 /// Whether indirect draws that read record after record of one argument
 /// buffer are clamped a window at a time (`VICTORY_INDIRECT_WINDOW=1`; off
@@ -183,7 +183,7 @@ const WINDOW_MOST: u64 = 64;
 /// before, at the next submission.
 fn windows() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WINDOW").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WINDOW").is_none_or(|v| v != "0"))
 }
 
 /// What one title list has set, and what its host list was last given.
@@ -1153,6 +1153,19 @@ impl State {
         // Depth textures it writes through unordered access: their colour
         // twins hold what they lack from here on.
         list.twins_written();
+        if compute
+            || p.stages.iter().any(|s| {
+                let t = s.translated();
+                t.stores
+                    || !s.root_uavs.is_empty()
+                    || t.used.iter().any(|u| u.kind == ResourceType::Uav)
+                    || t.host
+                        .root_srvs
+                        .contains(&victory_shader::emit::SLOT_STRIDES)
+            })
+        {
+            list.mark_uav_dirty();
+        }
         true
     }
 
@@ -2998,7 +3011,9 @@ impl State {
                 // A record a short step after the last window's last one
                 // (the same step as that window's, if it had one): the
                 // title walks the buffer, so the ones that step apart
-                // after it are clamped with it.
+                // after it are clamped with it. Only widen to `step` when at
+                // least two full steps fit in `args` so the clamp shader never
+                // reads past the end of `args.buffer`.
                 let (step, records) = match &self.window {
                     Some(w) if windowed && same(w) => {
                         let last = w.base + u64::from(w.records - 1) * u64::from(w.step);
@@ -3009,7 +3024,11 @@ impl State {
                             && (w.records == 1 || step == u64::from(w.step));
                         if walks {
                             let fit = (args.left(arguments) / step).min(WINDOW_MOST) as u32;
-                            (step as u32, (if w.records == 1 { 16 } else { w.records * 2 }).min(fit).max(1))
+                            if fit >= 2 {
+                                (step as u32, (if w.records == 1 { 16 } else { w.records * 2 }).min(fit))
+                            } else {
+                                (stride, max)
+                            }
                         } else {
                             (stride, max)
                         }
@@ -3032,7 +3051,6 @@ impl State {
                     crate::indirect::bound(list, (&args.buffer, offset), count_arg, (kind, step, records))
                 };
                 let Some(bounded) = bounded else {
-                    self.window = None;
                     why("not bounded (no clamp, or arguments not 4-byte aligned)");
                     return false;
                 };
