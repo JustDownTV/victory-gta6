@@ -783,6 +783,32 @@ fn merge_card_piece(gpu: &[u8], old: &mut [u8], title: &mut [u8], mask: &mut [u8
     differs != 0
 }
 
+#[cfg(all(test, windows))]
+mod run_gap_tests {
+    use super::{RUN_GAP, write_changed_runs};
+
+    #[test]
+    fn runs_close_together_go_back_in_one_write_and_far_ones_alone() {
+        let title: Vec<u8> = (0..512u32).map(|i| i as u8).collect();
+        let mut dst = vec![0xEEu8; 512];
+        let far = 2 * RUN_GAP + 100;
+        let written = write_changed_runs(dst.as_mut_ptr() as usize, &title, &[(0, 1), (10, 2), (far, 3)]);
+        // 0..12 in one write (the gap's bytes from `title`), then 3 more.
+        assert_eq!(written, 12 + 3);
+        assert_eq!(&dst[..12], &title[..12]);
+        assert!(dst[12..far].iter().all(|&b| b == 0xEE));
+        assert_eq!(&dst[far..far + 3], &title[far..far + 3]);
+    }
+}
+
+/// Bytes the GPU left alone between two changed runs below which the runs
+/// are written back as one: each run is a kernel write (`write_mapped`),
+/// and shader output changes bytes here and there in every word (floats,
+/// packed values). One write per run cost 630-690 ms a frame of copy-back
+/// in the game (42 ms before the runs); a cache line apart, a title write
+/// landing in the gap between two of the GPU's bytes is not to be feared.
+const RUN_GAP: usize = 64;
+
 /// Collects maximal contiguous nonzero byte runs in `mask` as
 /// `(offset, len)` pairs into `runs`.
 fn collect_mask_runs(mask: &[u8], runs: &mut Vec<(usize, usize)>) {
@@ -827,9 +853,25 @@ fn with_merge_scratch<R>(f: impl FnOnce(&mut Vec<u8>, &mut Vec<(usize, usize)>) 
 /// (upstream VIctory #2009).
 fn write_changed_runs(address: usize, title: &[u8], runs: &[(usize, usize)]) -> usize {
     let mut written = 0;
-    for &(off, len) in runs {
+    let mut write = |off: usize, len: usize| {
         crate::host::write_mapped((address + off) as *mut u8, title[off..].as_ptr(), len);
         written += len;
+    };
+    // Runs fewer than [`RUN_GAP`] bytes apart go in one write, the bytes
+    // between them as they are in `title` (what the title had).
+    let mut joined: Option<(usize, usize)> = None;
+    for &(off, len) in runs {
+        joined = match joined {
+            Some((at, end)) if off - end < RUN_GAP => Some((at, off + len)),
+            Some((at, end)) => {
+                write(at, end - at);
+                Some((off, off + len))
+            }
+            None => Some((off, off + len)),
+        };
+    }
+    if let Some((at, end)) = joined {
+        write(at, end - at);
     }
     written
 }
