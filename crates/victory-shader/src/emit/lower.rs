@@ -5592,6 +5592,18 @@ impl<'a> Lower<'a> {
                 }
                 return Ok(());
             }
+            // An image descriptor (eight dwords) whose sizes alone the code
+            // reads, sampling other images: the puddle detection programs
+            // (`PS_PuddleDetect`) take a texture's width, height and base
+            // level from the heap to scale their coordinates. The sizes of
+            // the view at that heap slot, read as a 2D image's; a dword with
+            // no host value (address, format) still stops the program.
+            // shortcut: a view of another dimension at the slot answers for
+            // a 2D one.
+            if count == 8 {
+                let src = Source::Loaded { load: site, first: 0 };
+                return self.descriptor_words(inst, site, code, count, 0, &src, ((2, 0x409), Some(2)), false, None);
+            }
             return Err("a descriptor read only as data");
         };
         let src = Source::Loaded { load: site, first };
@@ -5644,7 +5656,28 @@ impl<'a> Lower<'a> {
             }
             _ => return Err("a scalar memory read as data"),
         };
-        let h = self.handle(site, &src, false, props)?;
+        self.descriptor_words(inst, site, code, count, first, &src, (props, image), uav, used)
+    }
+
+    /// The dwords `count` of `inst` (a descriptor load at `site` into SGPRs
+    /// from `code`, the descriptor at its dword `first`) as the code reads
+    /// them: rebuilt from the dimensions of the host view `src` names with
+    /// `props` (an image of kind `image`, or a buffer), the others missing.
+    #[allow(clippy::too_many_arguments)]
+    fn descriptor_words(
+        &mut self,
+        inst: &Inst,
+        site: Site,
+        code: u8,
+        count: u32,
+        first: u8,
+        src: &Source,
+        (props, image): ((u32, u32), Option<u32>),
+        uav: bool,
+        used: Option<&UsedResource>,
+    ) -> Result<(), Why> {
+        const OTHER: Why = "a descriptor's address or format read as data";
+        let h = self.handle(site, src, false, props)?;
         let c = self.cur;
         let i32t = self.s.t.i32;
         let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
