@@ -1152,9 +1152,26 @@ mod host {
             // to the pad (the title's start screen) saw nothing.
             #[cfg(feature = "diagnostics")]
             if slot == 0 {
-                for vk in scripted() {
+                let keys = scripted();
+                for &vk in &keys {
                     if let Some(&(_, button)) = super::FALLBACK_BUTTONS.iter().find(|(key, _)| *key == vk) {
                         pad.buttons |= button;
+                    }
+                }
+                // And its sticks and triggers (W/A/S/D, I/J/K/L, Z, C),
+                // where a scripted key holds one.
+                let held: Vec<KeyState> = keys.iter().map(|&vk| KeyState { virtual_key: vk, ..Default::default() }).collect();
+                let stand_in = super::fallback(&held);
+                for (to, from) in [
+                    (&mut pad.left_x, stand_in.left_x),
+                    (&mut pad.left_y, stand_in.left_y),
+                    (&mut pad.right_x, stand_in.right_x),
+                    (&mut pad.right_y, stand_in.right_y),
+                    (&mut pad.left_trigger, stand_in.left_trigger),
+                    (&mut pad.right_trigger, stand_in.right_trigger),
+                ] {
+                    if from != 0.0 {
+                        *to = from;
                     }
                 }
             }
@@ -1198,43 +1215,61 @@ mod host {
         }
     }
 
-    /// Debugging aid: `VICTORY_KEYS=<seconds>:<key>,...` holds each key for
-    /// 0.2 s that long after input starts, with or without focus. A key is a
-    /// letter, a digit, or `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`,
-    /// `Left`, `Right` (the stand-in pad's table maps them to buttons).
+    /// Debugging aid: `VICTORY_KEYS=<seconds>:<key>[:<held seconds>],...`
+    /// holds each key for 0.2 s (or the seconds given) that long after input
+    /// starts, with or without focus. A key is a letter, a digit, or `Enter`,
+    /// `Esc`, `Tab`, `Back`, `Up`, `Down`, `Left`, `Right` (the stand-in
+    /// pad's table maps them to buttons, sticks and triggers, which a real
+    /// pad gets too).
     #[cfg(feature = "diagnostics")]
     fn scripted() -> Vec<u8> {
-        static SCRIPT: LazyLock<(Instant, Vec<(Duration, u8)>)> = LazyLock::new(|| {
+        static SCRIPT: LazyLock<(Instant, Vec<(Duration, u8, Duration)>)> = LazyLock::new(|| {
             let list = std::env::var("VICTORY_KEYS").unwrap_or_default();
-            let keys = list.split(',').filter_map(|entry| {
-                let (at, key) = entry.split_once(':')?;
-                let vk = match key.trim() {
-                    "Enter" => 0x0D,
-                    "Esc" => 0x1B,
-                    "Tab" => 0x09,
-                    "Back" => 0x08,
-                    "Up" => 0x26,
-                    "Down" => 0x28,
-                    "Left" => 0x25,
-                    "Right" => 0x27,
-                    k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
-                        k.as_bytes()[0].to_ascii_uppercase()
-                    }
-                    _ => return None,
-                };
-                Some((
-                    Duration::try_from_secs_f64(at.trim().parse().ok()?).ok()?,
-                    vk,
-                ))
-            });
+            let keys = list.split(',').filter_map(|entry| parse_key(entry));
             (Instant::now(), keys.collect())
         });
         let (start, keys) = &*SCRIPT;
         let now = start.elapsed();
         keys.iter()
-            .filter(|&&(at, _)| (at..at + Duration::from_millis(200)).contains(&now))
-            .map(|&(_, vk)| vk)
+            .filter(|&&(at, _, held)| (at..at + held).contains(&now))
+            .map(|&(_, vk, _)| vk)
             .collect()
+    }
+
+    /// One entry of `VICTORY_KEYS`: when, the virtual key, for how long.
+    #[cfg(feature = "diagnostics")]
+    fn parse_key(entry: &str) -> Option<(Duration, u8, Duration)> {
+        let mut parts = entry.split(':');
+        let (at, key) = (parts.next()?, parts.next()?);
+        let held = match parts.next() {
+            Some(s) => Duration::try_from_secs_f64(s.trim().parse().ok()?).ok()?,
+            None => Duration::from_millis(200),
+        };
+        let vk = match key.trim() {
+            "Enter" => 0x0D,
+            "Esc" => 0x1B,
+            "Tab" => 0x09,
+            "Back" => 0x08,
+            "Up" => 0x26,
+            "Down" => 0x28,
+            "Left" => 0x25,
+            "Right" => 0x27,
+            k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => k.as_bytes()[0].to_ascii_uppercase(),
+            _ => return None,
+        };
+        Some((Duration::try_from_secs_f64(at.trim().parse().ok()?).ok()?, vk, held))
+    }
+
+    /// A scripted key is held 0.2 s, or the seconds its entry gives.
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn scripted_keys_are_held_as_long_as_asked() {
+        let s = Duration::from_secs_f64;
+        assert_eq!(parse_key("30:Enter"), Some((s(30.0), 0x0D, s(0.2))));
+        assert_eq!(parse_key(" 150.5 : l : 3 "), Some((s(150.5), b'L', s(3.0))));
+        assert_eq!(parse_key("12:Nope"), None);
+        assert_eq!(parse_key("12"), None);
+        assert_eq!(parse_key("12:W:x"), None);
     }
 
     /// The foreground window is one of ours (the title's or our fallback).
