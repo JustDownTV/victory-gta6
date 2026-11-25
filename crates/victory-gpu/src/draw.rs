@@ -181,6 +181,16 @@ const WINDOW_MOST: u64 = 256;
 /// (`crate::indirect::bound_ahead`); a tail record that looks real is
 /// charged what it asks, a few thousand of 2^27. And arguments the title's CPU side changes are seen as
 /// before, at the next submission.
+/// Indirect window diagnostics: [hits, miss_dispatch, miss_max, miss_count,
+/// miss_stores, miss_no_window_or_diff, miss_step_or_fit].
+#[cfg(feature = "diagnostics")]
+static WINDOW_STATS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+
+#[cfg(feature = "diagnostics")]
+pub(crate) fn take_window_stats() -> [u64; 7] {
+    WINDOW_STATS.each_ref().map(|c| c.swap(0, Ordering::Relaxed))
+}
+
 fn windows() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WINDOW").is_none_or(|v| v != "0"))
@@ -1811,14 +1821,13 @@ impl State {
         // The rest waits for the next frames, as it does past the bytes.
         static SPAN_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
         let span = std::time::Duration::from_millis(*SPAN_MS.get_or_init(|| {
-            std::env::var("VICTORY_TEXTURE_STAGE_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(250)
+            std::env::var("VICTORY_TEXTURE_STAGE_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(20)
         }));
-        // A backlog (a scene's first minutes: 22,000 slots due, 2-3 minutes of black
-        // surfaces at 192 MB a frame) gets three times the bytes and the time until it
+        // A backlog (a scene's first minutes) gets twice the bytes and time until it
         // drains; `VICTORY_TEXTURE_CATCHUP=0` keeps the plain budget.
         static CATCHUP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let catchup = *CATCHUP.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_CATCHUP").is_none_or(|v| v != "0"));
-        let (per_frame, span) = if catchup && due.len() >= 1024 { (per_frame * 3, span * 3) } else { (per_frame, span) };
+        let (per_frame, span) = if catchup && due.len() >= 1024 { (per_frame * 2, span * 2) } else { (per_frame, span) };
         // A run made early (`State::early_textures`) has a budget of its
         // own: its bytes on top of what the frame has spent so far.
         // (Not `most`: that is the longest wait between looks, used below.)
@@ -3016,6 +3025,8 @@ impl State {
             .map(|w| (w.scratch.clone(), offset - w.base, w.step));
         let (bounded, at) = match hit {
             Some((scratch, at, step)) => {
+                #[cfg(feature = "diagnostics")]
+                WINDOW_STATS[0].fetch_add(1, Ordering::Relaxed);
                 // Diagnostics of windows: the record clamped again and
                 // compared (`crate::indirect::window_check`).
                 if crate::indirect::window_check()
@@ -3033,6 +3044,23 @@ impl State {
                 (scratch, at)
             }
             None => {
+                #[cfg(feature = "diagnostics")]
+                {
+                    let idx = if kind == DISPATCH {
+                        1
+                    } else if max != 1 {
+                        2
+                    } else if count.is_some() {
+                        3
+                    } else if p.stages.iter().any(|stage| stage.translated().stores) {
+                        4
+                    } else if self.window.as_ref().is_none_or(|w| !same(w)) {
+                        5
+                    } else {
+                        6
+                    };
+                    WINDOW_STATS[idx].fetch_add(1, Ordering::Relaxed);
+                }
                 // A record a short step after the last window's last one
                 // (the same step as that window's, if it had one): the
                 // title walks the buffer, so the ones that step apart

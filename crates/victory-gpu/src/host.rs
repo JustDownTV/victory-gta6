@@ -2240,6 +2240,8 @@ static QUEUE_ORDER: Mutex<u64> = Mutex::new(0);
 /// card with nothing to land, microseconds it waited for fetches of card
 /// copies' pieces, microseconds of landing in all.
 static RELAY_STATS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+#[cfg(feature = "diagnostics")]
+static RELAY_PARTS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
 /// Since the last frame-rate line, with [`inflight_fetch`]: pieces merged
 /// from the slots their flights fetched them to, their bytes, landings that
@@ -3518,6 +3520,16 @@ fn late_line(frames: f64) {
             r[3] / 1000.0,
             r[4] / 1000.0,
         );
+        #[cfg(feature = "diagnostics")]
+        {
+            let p = RELAY_PARTS.each_ref().map(|c| c.swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
+            let w = crate::draw::take_window_stats().map(|c| c as f64 / frames);
+            tracing::info!(
+                "relay parts per frame: card_back {:.1} ms, hand_back {:.1} ms, done {:.1} ms; \
+                 indirect windows per frame: hits {:.0}, miss(dispatch {:.0}, max>1 {:.0}, counted {:.0}, stores {:.0}, new/diff {:.0}, step/fit {:.0})",
+                p[0], p[1], p[2], w[0], w[1], w[2], w[3], w[4], w[5], w[6],
+            );
+        }
         if inflight_fetch() {
             let i: Vec<f64> = INFLIGHT_STATS.iter().map(|i| i.swap(0, Ordering::Relaxed) as f64 / frames).collect();
             tracing::info!(
@@ -4985,60 +4997,14 @@ impl Host {
         // their tickets are landed (`inflight_tickets_landed`, after this).
         let piece_count = pieces.len() as u64;
         let bytes: u64 = pieces.iter().map(|p| (p.2 - p.1) as u64).sum();
-        let written = if wide_merge() && pieces.len() >= 4 {
-            // Group pieces by shadow while preserving exact plan order within
-            // each shadow, then balance shadow groups across up to 8 workers.
-            let mut by_shadow: std::collections::HashMap<usize, Vec<Piece>> = std::collections::HashMap::new();
-            for item in pieces {
-                by_shadow.entry(Arc::as_ptr(&item.0) as usize).or_default().push(item);
-            }
-            let mut groups: Vec<Vec<Piece>> = by_shadow.into_values().collect();
-            let buckets = groups.len().min(8);
-            let mut shards: Vec<Vec<Piece>> = (0..buckets).map(|_| Vec::new()).collect();
-            let mut shard_bytes = vec![0usize; buckets];
-            groups.sort_unstable_by_key(|g| std::cmp::Reverse(g.iter().map(|x| x.2 - x.1).sum::<usize>()));
-            for group in groups {
-                let gbytes: usize = group.iter().map(|x| x.2 - x.1).sum();
-                let idx = shard_bytes
-                    .iter()
-                    .enumerate()
-                    .min_by_key(|&(_, &b)| b)
-                    .map_or(0, |(i, _)| i);
-                shard_bytes[idx] += gbytes;
-                shards[idx].extend(group);
-            }
-            let written_total = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            let jobs: Vec<Box<dyn FnOnce() + Send>> = shards
-                .into_iter()
-                .filter(|s| !s.is_empty())
-                .map(|shard| {
-                    let written_total = written_total.clone();
-                    Box::new(move || {
-                        let mut title = Vec::new();
-                        let mut local = 0usize;
-                        for (shadow, lo, hi, at, after) in shard {
-                            // SAFETY: inside the mapping of the slots; `wide_run`
-                            // waits for this job before tickets are landed.
-                            let gpu = unsafe { std::slice::from_raw_parts(at as *const u8, hi - lo) };
-                            local += shadow.card_merge_relay(lo, gpu, after, &mut title);
-                        }
-                        written_total.fetch_add(local, Ordering::Relaxed);
-                    }) as Box<dyn FnOnce() + Send>
-                })
-                .collect();
-            crate::shadow::wide_run(jobs);
-            written_total.load(Ordering::Relaxed)
-        } else {
-            let mut title = Vec::new();
-            let mut written = 0;
-            for (shadow, lo, hi, at, after) in &pieces {
-                // SAFETY: inside the mapping of the slots (checked above); the
-                // copy into it ran in the plan's flight, which the card has run.
-                let gpu = unsafe { std::slice::from_raw_parts(*at as *const u8, hi - lo) };
-                written += shadow.card_merge_relay(*lo, gpu, *after, &mut title);
-            }
-            written
-        };
+        let mut title = Vec::new();
+        let mut written = 0;
+        for (shadow, lo, hi, at, after) in &pieces {
+            // SAFETY: inside the mapping of the slots (checked above); the
+            // copy into it ran in the plan's flight, which the card has run.
+            let gpu = unsafe { std::slice::from_raw_parts(*at as *const u8, hi - lo) };
+            written += shadow.card_merge_relay(*lo, gpu, *after, &mut title);
+        }
         for plan in plans {
             for r in &plan.ranges {
                 crate::shadow::CARD_STATS[2].fetch_add(u64::from(r.span.pieces), Ordering::Relaxed);
@@ -5089,7 +5055,11 @@ impl Host {
                 let plans: Vec<(u64, &CardPlan)> = flights.iter().filter_map(|f| f.card.as_ref().map(|card| (f.number, card))).collect();
                 let behind = flights.iter().map(|f| f.fence).max().unwrap_or(0);
                 let landed = flights.iter().map(|f| f.number).max().unwrap_or(0);
+                #[cfg(feature = "diagnostics")]
+                let t_card = std::time::Instant::now();
                 self.relay_card_back(&plans, fetch, behind, landed);
+                #[cfg(feature = "diagnostics")]
+                RELAY_PARTS[0].fetch_add(t_card.elapsed().as_micros() as u64, Ordering::Relaxed);
                 let mut back: Vec<Declared> = Vec::new();
                 for flight in &flights {
                     for (shadow, ranges) in &flight.back {
@@ -5105,14 +5075,22 @@ impl Host {
                         }
                     }
                 }
+                #[cfg(feature = "diagnostics")]
+                let t_hand = std::time::Instant::now();
                 relay_hand_back(&back);
+                #[cfg(feature = "diagnostics")]
+                RELAY_PARTS[1].fetch_add(t_hand.elapsed().as_micros() as u64, Ordering::Relaxed);
                 // Only now, and flight by flight: a range another flight
                 // in the air declared too stays closed to refreshes.
+                #[cfg(feature = "diagnostics")]
+                let t_done = std::time::Instant::now();
                 for flight in &flights {
                     for (shadow, ranges) in &flight.back {
                         shadow.copy_back_done(ranges);
                     }
                 }
+                #[cfg(feature = "diagnostics")]
+                RELAY_PARTS[2].fetch_add(t_done.elapsed().as_micros() as u64, Ordering::Relaxed);
                 COPY_BACK[0].fetch_add(landing.elapsed().as_micros() as u64, Ordering::Relaxed);
                 RELAY_STATS[0].fetch_add(1, Ordering::Relaxed);
                 RELAY_STATS[1].fetch_add(flights.len() as u64, Ordering::Relaxed);
