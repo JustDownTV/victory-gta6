@@ -58,7 +58,9 @@ pub const MEMORY_PAGES: u32 = 1 << 21;
 /// Dwords of the [`SLOT_FAULTS`] buffer that take page numbers. After them,
 /// [`MEMORY_COPIES`] more: dword `n` is set to 1 by an access that found
 /// copy `n`, so the host knows which copies shaders use (the access that
-/// found its page writes there instead of the sink, at no extra cost).
+/// found its page writes there instead of the sink, at no extra cost); a
+/// store or atomic sets its mark in [`MEMORY_COPIES`] more after those
+/// instead, so the host knows which copies shaders write.
 pub const MEMORY_FAULTS: u32 = 4096;
 /// Copies the [`SLOT_MEMORY`] directory can name, the null one included:
 /// numbers are clamped below it.

@@ -74,6 +74,9 @@ struct Memory {
     /// Per copy (as `copies`): the last frame shaders touched it (or it
     /// was numbered), from the marks after the faults.
     touched: Vec<u64>,
+    /// Per copy: the last frame shaders wrote it (`u64::MAX`: never), from
+    /// the write marks.
+    written: Vec<u64>,
     /// Per host view heap (by address): the first slot of its run, and how
     /// many copies have their view there.
     heaps: HashMap<usize, (u32, u32)>,
@@ -112,9 +115,10 @@ impl Memory {
         tracing::info!("title memory by address: a shader reads or writes through raw addresses");
         Some(Memory {
             directory: make(u64::from(MEMORY_PAGES) * 2, "directory")?,
-            faults: make(u64::from(MEMORY_FAULTS + MEMORY_COPIES), "faults")?,
+            faults: make(u64::from(MEMORY_FAULTS + 2 * MEMORY_COPIES), "faults")?,
             copies: Vec::new(),
             touched: Vec::new(),
+            written: Vec::new(),
             heaps: HashMap::new(),
             frame: u64::MAX,
             refused: Default::default(),
@@ -176,6 +180,7 @@ impl Memory {
             None if self.copies.len() < COPIES as usize => {
                 self.copies.push(shadow.clone());
                 self.touched.push(crate::frame::current());
+                self.written.push(u64::MAX);
                 let n = self.copies.len() - 1;
                 // Every page the copy holds whole, not only the one asked
                 // for: a structure is more than 64 KiB.
@@ -253,6 +258,15 @@ impl Memory {
             // SAFETY: as above.
             if unsafe { at.read_volatile() } != 0 {
                 self.touched[n] = self.frame;
+                // SAFETY: as above.
+                unsafe { at.write_volatile(0) };
+            }
+            // SAFETY: as above, the write marks after the read marks.
+            let at = unsafe { at.add(MEMORY_COPIES as usize) };
+            // SAFETY: as above.
+            if unsafe { at.read_volatile() } != 0 {
+                self.touched[n] = self.frame;
+                self.written[n] = self.frame;
                 // SAFETY: as above.
                 unsafe { at.write_volatile(0) };
             }
@@ -363,7 +377,22 @@ pub(crate) fn ready(
         if wanted && list.first_use(Arc::as_ptr(shadow) as usize | 1) {
             shadow.refresh(list, start, len);
         }
-        if writes && (first_write || n >= numbered) {
+        // Writes that become the card's: only copies the dispatch names or
+        // shaders wrote lately (their write marks), not every copy (the
+        // builder reaches some 950: 3.8 GB the title could no longer touch
+        // without a fault). Once per list and copy.
+        // shortcut: a copy first written through a pointer is not the
+        // card's for that frame (what is written there is not put back).
+        let card = crate::shadow::card_owned();
+        let declared = match card {
+            true => {
+                let lately = m.written[n] != u64::MAX && frame.saturating_sub(m.written[n]) <= TOUCHED_FRAMES;
+                (held.contains(&n) || lately)
+                    && list.first_use(Arc::as_ptr(shadow) as usize | 3)
+            }
+            false => first_write || n >= numbered,
+        };
+        if writes && declared {
             shadow.gpu_writes(list, start, len);
         }
     }

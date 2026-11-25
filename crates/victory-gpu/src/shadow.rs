@@ -153,6 +153,144 @@ fn own(owned: &mut Vec<(u64, u64)>, a: u64, b: u64) {
     owned.insert(at, (a, b));
 }
 
+/// Title blocks of 64 KiB whose bytes the card owns, made no-access, and
+/// the copy holding them: the title's first touch of one (a read of what
+/// the builder wrote, sizes and counters, or a write) takes a fault, and
+/// [`on_card_block`] puts the card's bytes back first.
+static CARD_BLOCKS: Mutex<std::collections::BTreeMap<usize, std::sync::Weak<Shadow>>> =
+    Mutex::new(std::collections::BTreeMap::new());
+/// Blocks guarded so, and given back on a touch, since the start.
+static CARD_GUARDED: AtomicU64 = AtomicU64::new(0);
+static CARD_GIVEN: AtomicU64 = AtomicU64::new(0);
+const CARD_BLOCK: usize = 64 << 10;
+
+/// Makes the blocks of `[at, at + n)` no-access and notes them the card's
+/// (the copy `shadow`'s). At a submission, after its refreshes.
+/// shortcut: another host copy of the same bytes (a buffer inside a window)
+/// that refreshes them reads zeros while they are guarded, and a write guard
+/// (`watch.rs`) put on such a block since takes ours away.
+fn guard_card_blocks(shadow: &std::sync::Weak<Shadow>, at: u64, n: u64) {
+    use windows_sys::Win32::System::Memory::{PAGE_NOACCESS, VirtualProtect};
+    install_card_handler();
+    let mut blocks = CARD_BLOCKS.lock().unwrap_or_else(|e| e.into_inner());
+    let (first, end) = (at as usize / CARD_BLOCK, ((at + n) as usize).div_ceil(CARD_BLOCK));
+    for block in first..end {
+        if blocks.contains_key(&block) {
+            continue;
+        }
+        let mut old = 0;
+        // SAFETY: title memory; only its protection changes.
+        if unsafe { VirtualProtect((block * CARD_BLOCK) as *const _, CARD_BLOCK, PAGE_NOACCESS, &mut old) } != 0 {
+            blocks.insert(block, shadow.clone());
+            CARD_GUARDED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// The runtime mapped or unmapped title memory `[at, at + len)`: what it
+/// shows is new and read-write, and none of it is the card's any more.
+pub(crate) fn card_blocks_gone(at: usize, len: usize) {
+    let mut blocks = CARD_BLOCKS.lock().unwrap_or_else(|e| e.into_inner());
+    let range = at / CARD_BLOCK..at.saturating_add(len).div_ceil(CARD_BLOCK);
+    let gone: Vec<(usize, std::sync::Weak<Shadow>)> = blocks.range(range).map(|(&b, s)| (b, s.clone())).collect();
+    for (block, shadow) in gone {
+        blocks.remove(&block);
+        if let Some(s) = shadow.upgrade() {
+            let mut owned = s.owned.lock().unwrap_or_else(|e| e.into_inner());
+            let (a, b) = ((block * CARD_BLOCK) as u64, ((block + 1) * CARD_BLOCK) as u64);
+            let kept = owned.iter().flat_map(|&(s, e)| not_owned(&[(a, b)], s, e)).collect();
+            *owned = kept;
+        }
+    }
+}
+
+/// Blocks guarded and given back (see [`CARD_BLOCKS`]), for the log.
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+pub(crate) fn card_block_counts() -> (u64, u64, usize) {
+    let now = CARD_BLOCKS.lock().unwrap_or_else(|e| e.into_inner()).len();
+    (CARD_GUARDED.load(Ordering::Relaxed), CARD_GIVEN.load(Ordering::Relaxed), now)
+}
+
+/// A touch of a block the card owns: its access back, the card's bytes put
+/// back into it (what the title then reads is what the GPU wrote: the
+/// title reads results after waiting for the GPU), and it is the title's
+/// again. Any other fault goes on to the other handlers.
+fn on_card_block(at: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
+    let block = at / CARD_BLOCK;
+    // Held while the bytes go back: a thread that faults on the block
+    // meanwhile waits here, then finds it given back.
+    let mut blocks = CARD_BLOCKS.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(shadow) = blocks.remove(&block) else {
+        return false;
+    };
+    RECENT_GIVEN.lock().unwrap_or_else(|e| e.into_inner()).insert(block);
+    let mut old = 0;
+    // SAFETY: a block we made no-access.
+    unsafe { VirtualProtect((block * CARD_BLOCK) as *const _, CARD_BLOCK, PAGE_READWRITE, &mut old) };
+    // shortcut: a thread that reads the block without a fault between the
+    // line above and the copy sees the title's old bytes.
+    if let Some(s) = shadow.upgrade() {
+        s.give_back((block * CARD_BLOCK) as u64, CARD_BLOCK as u64);
+    }
+    true
+}
+
+/// Registers [`on_card_block`]'s handler once, ahead of the others.
+fn install_card_handler() {
+    use windows_sys::Win32::Foundation::{EXCEPTION_ACCESS_VIOLATION, NTSTATUS};
+    use windows_sys::Win32::System::Diagnostics::Debug::{
+        AddVectoredExceptionHandler, EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH,
+        EXCEPTION_POINTERS,
+    };
+    unsafe extern "system" fn on_fault(info: *mut EXCEPTION_POINTERS) -> i32 {
+        // SAFETY: the system passes the exception being dispatched.
+        let r = unsafe { &*(*info).ExceptionRecord };
+        if r.ExceptionCode != EXCEPTION_ACCESS_VIOLATION as NTSTATUS || r.NumberParameters < 2 {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+        // A read (0) or a write (1); not an execution.
+        if r.ExceptionInformation[0] > 1 {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+        if on_card_block(r.ExceptionInformation[1]) || card_block_open(r.ExceptionInformation[1]) {
+            EXCEPTION_CONTINUE_EXECUTION
+        } else {
+            EXCEPTION_CONTINUE_SEARCH
+        }
+    }
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    // SAFETY: the handler only touches our block state, protections and
+    // the copies' mappings.
+    ONCE.call_once(|| unsafe {
+        AddVectoredExceptionHandler(1, Some(on_fault));
+    });
+}
+
+/// Whether `at` lies in a block given back since the fault was raised (it
+/// is read-write now): the access is tried again.
+fn card_block_open(at: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_READWRITE, VirtualQuery};
+    if CARD_GIVEN.load(Ordering::Relaxed) == 0 {
+        return false;
+    }
+    // SAFETY: plain data filled in by the query.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the right size.
+    let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+    // Only a block we guarded and gave back can have changed under the
+    // faulting access; anything else that is read-write now is not ours to
+    // judge, so only those count.
+    n != 0 && info.State == MEM_COMMIT && info.Protect == PAGE_READWRITE && was_card_block(at / CARD_BLOCK)
+}
+
+/// Blocks given back lately, so that a second thread's fault on one is
+/// tried again (see [`card_block_open`]).
+fn was_card_block(block: usize) -> bool {
+    RECENT_GIVEN.lock().unwrap_or_else(|e| e.into_inner()).contains(&block)
+}
+static RECENT_GIVEN: Mutex<std::collections::BTreeSet<usize>> = Mutex::new(std::collections::BTreeSet::new());
+
 #[cfg(test)]
 mod owned_tests {
     use super::{not_owned, own};
@@ -2119,12 +2257,40 @@ impl Shadow {
             return;
         }
         let len = len.min(self.left(address));
-        if card_owned() {
+        // The card's (see [`card_owned_while`]), for a copy the GPU writes
+        // where the CPU reads it (not one with a buffer on the card).
+        if card_owned() && self.card.is_none() {
             let mut owned = self.owned.lock().unwrap_or_else(|e| e.into_inner());
             own(&mut owned, address, address + len);
+            drop(owned);
+            // Guarded once the submission's refreshes have read the title's
+            // bytes there: the title's first touch puts the card's back.
+            let me = Arc::downgrade(self);
+            list.defer(move || guard_card_blocks(&me, address, len));
             return;
         }
         list.defer_gpu_write(self, address as usize, len as usize);
+    }
+
+    /// The card's bytes of `[at, at + n)` (what of it the copy holds) put
+    /// back into title memory, and that memory the title's again: from now
+    /// on refreshes copy it. For the guard handler, with the block's access
+    /// given back already.
+    fn give_back(&self, at: u64, n: u64) {
+        let a = at.max(self.start);
+        let b = (at + n).min(self.start + self.len);
+        if a >= b {
+            return;
+        }
+        // SAFETY: inside the copy's mapping and the title's block, which is
+        // read-write now.
+        unsafe {
+            std::ptr::copy_nonoverlapping(self.data.add((a - self.start) as usize), a as *mut u8, (b - a) as usize);
+        }
+        let mut owned = self.owned.lock().unwrap_or_else(|e| e.into_inner());
+        let kept = owned.iter().flat_map(|&(s, e)| not_owned(&[(a, b)], s, e)).collect();
+        *owned = kept;
+        CARD_GIVEN.fetch_add(1, Ordering::Relaxed);
     }
 
     /// A window on the card with no CPU side ([`lean_windows`]).

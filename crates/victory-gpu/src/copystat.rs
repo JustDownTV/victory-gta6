@@ -1085,6 +1085,12 @@ pub(crate) fn log(frames: f64) {
         mb(c[C::TexHashed as usize]),
         mb(c[C::TexChanged as usize]),
     );
+    let (guarded, given, now) = crate::shadow::card_block_counts();
+    if guarded > 0 {
+        tracing::info!(
+            "blocks of 64 KiB the card owns (VICTORY_BVH_CARD): {now} guarded now; since the start {guarded} guarded, {given} given back on a touch of the title"
+        );
+    }
     tracing::info!(
         "recording per frame ({frames:.0} frames): {:.0} list calls {:.1} ms (all recording \
          threads); {:.1} ms waiting for pipelines; dynamic slots: {:.0} tables asked, {:.0} \
