@@ -204,6 +204,25 @@ pub(crate) fn card_blocks_gone(at: usize, len: usize) {
     }
 }
 
+/// Before the kernel writes title memory `[at, at + len)` for the title
+/// (a file read into it, `watch::writing`): the card's blocks there are
+/// given back first. The kernel does not fault into our handler, its write
+/// to a no-access block fails, and the title then waited for a read that
+/// never came (the loading stopped 0.7 s after the builder started).
+pub(crate) fn card_blocks_give_back(at: usize, len: usize) {
+    let range = at / CARD_BLOCK..at.saturating_add(len).div_ceil(CARD_BLOCK);
+    let held: Vec<usize> = {
+        let blocks = CARD_BLOCKS.lock().unwrap_or_else(|e| e.into_inner());
+        if blocks.is_empty() {
+            return;
+        }
+        blocks.range(range).map(|(&b, _)| b).collect()
+    };
+    for block in held {
+        on_card_block(block * CARD_BLOCK);
+    }
+}
+
 /// Blocks guarded and given back (see [`CARD_BLOCKS`]), for the log.
 #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
 pub(crate) fn card_block_counts() -> (u64, u64, usize) {

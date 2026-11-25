@@ -582,6 +582,8 @@ fn open(g: &mut Guards, start: usize, end: usize) -> bool {
 pub fn writing(at: usize, len: usize) {
     // The length is the title's (`fread`'s size times count, saturated).
     open(&mut guards(), at, at.saturating_add(len));
+    // The card's blocks there too, with its bytes put back.
+    crate::shadow::card_blocks_give_back(at, len);
     // A placed texture there changes with no descriptor written.
     crate::descriptor::host::remapped(at, len);
 }
