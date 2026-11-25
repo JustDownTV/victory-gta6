@@ -757,14 +757,16 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
             .collect();
         // Buffers have host copies, not resources the barrier can name:
         // a barrier on one waits for every shader write before it.
-        if barriers.iter().any(|b| {
+        let buffer_wait = barriers.iter().any(|b| {
             b.kind != 1 && !b.first.is_null() && crate::resource::buffer_bytes(b.first).is_some()
-        }) {
+        });
+        let global_uav = host.iter().any(|b| b.kind == 2 && b.first.is_null());
+        if buffer_wait {
             host.push(UAV_BARRIER);
             list.clear_uav_dirty();
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::WaitsForBuffers, 1);
-        } else if host.iter().any(|b| b.kind == 2 && b.first.is_null()) {
+        } else if global_uav {
             list.clear_uav_dirty();
         }
         if !host.is_empty() {
@@ -1576,16 +1578,27 @@ mod state {
         one_range: i32,
         depth: *const u64,
     ) {
-        let handles: Vec<u64> = if one_range != 0 && !handles.is_null() {
-            // SAFETY: the title passes the first handle.
-            let first = unsafe { *handles };
-            (0..u64::from(count)).map(|i| first + 128 * i).collect()
-        } else {
-            items(handles, count).to_vec()
-        };
         // SAFETY: the title passes a handle or null.
         let depth = unsafe { depth.as_ref() }.copied().unwrap_or(0);
-        with_state(this, |list, s| s.set_targets(list, &handles, depth));
+        if one_range != 0 && !handles.is_null() {
+            // SAFETY: the title passes the first handle.
+            let first = unsafe { *handles };
+            if count <= 8 {
+                let mut buf = [0u64; 8];
+                for (i, slot) in buf[..count as usize].iter_mut().enumerate() {
+                    *slot = first + 128 * i as u64;
+                }
+                with_state(this, |list, s| {
+                    s.set_targets(list, &buf[..count as usize], depth)
+                });
+            } else {
+                let handles: Vec<u64> = (0..u64::from(count)).map(|i| first + 128 * i).collect();
+                with_state(this, |list, s| s.set_targets(list, &handles, depth));
+            }
+        } else {
+            let handles = items(handles, count);
+            with_state(this, |list, s| s.set_targets(list, handles, depth));
+        }
     }
     pub(super) extern "system" fn draw(
         this: This,

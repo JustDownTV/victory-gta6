@@ -597,7 +597,20 @@ impl State {
         self.depth_handle = depth;
         self.targets_set = true;
         self.targets.clear();
-        let mut rtvs = Vec::new();
+        let mut rtv_stack = [D3D12_CPU_DESCRIPTOR_HANDLE::default(); 8];
+        let mut rtv_len = 0usize;
+        let mut rtv_heap: Vec<D3D12_CPU_DESCRIPTOR_HANDLE> = Vec::new();
+        let mut push_rtv = |h: D3D12_CPU_DESCRIPTOR_HANDLE| {
+            if rtv_heap.is_empty() && rtv_len < rtv_stack.len() {
+                rtv_stack[rtv_len] = h;
+                rtv_len += 1;
+            } else {
+                if rtv_heap.is_empty() {
+                    rtv_heap.extend_from_slice(&rtv_stack[..rtv_len]);
+                }
+                rtv_heap.push(h);
+            }
+        };
         for &h in handles {
             let Some(record) = crate::descriptor::rtv_record(h) else {
                 once!(
@@ -617,15 +630,20 @@ impl State {
                     .desc()
                     .filter(|d| d.Format.0 != 0 && d.ViewDimension.0 != 0);
                 if let Some(desc) = null {
-                    rtvs.push(host.rtv(None, Some(&desc)));
+                    push_rtv(host.rtv(None, Some(&desc)));
                 }
                 continue;
             };
             self.targets.push(record.resource as usize);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
-            rtvs.push(host.rtv(Some(texture), record.desc().as_ref()));
+            push_rtv(host.rtv(Some(texture), record.desc().as_ref()));
         }
+        let rtvs: &[D3D12_CPU_DESCRIPTOR_HANDLE] = if rtv_heap.is_empty() {
+            &rtv_stack[..rtv_len]
+        } else {
+            &rtv_heap
+        };
         self.depth = 0;
         self.depth_state = DEPTH_WRITE;
         let dsv = crate::descriptor::dsv_record(depth).and_then(|record| {
@@ -1019,7 +1037,14 @@ impl State {
                 None
             };
             if let Some((param, dwords)) = stage.user_data {
-                let mut values = vec![0u32; dwords as usize];
+                let mut stack_values = [0u32; 64];
+                let mut heap_values = Vec::new();
+                let values: &mut [u32] = if (dwords as usize) <= stack_values.len() {
+                    &mut stack_values[..dwords as usize]
+                } else {
+                    heap_values.resize(dwords as usize, 0);
+                    &mut heap_values
+                };
                 for u in &t.host.user_data {
                     if let RootType::Other(kind) = u.root {
                         values[u.index as usize] =
@@ -1153,6 +1178,9 @@ impl State {
         // Depth textures it writes through unordered access: their colour
         // twins hold what they lack from here on.
         list.twins_written();
+        if compute || p.stages.iter().any(|s| s.translated().stores) {
+            self.window = None;
+        }
         if compute
             || p.stages.iter().any(|s| {
                 let t = s.translated();
@@ -2350,7 +2378,6 @@ impl State {
     /// Runs a mesh dispatch of `x` groups on the host (the title's mesh
     /// programs are one-dimensional).
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
-        self.window = None;
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
         let ran = mesh_test() != 1
@@ -2741,7 +2768,6 @@ impl State {
         first: u32,
         first_instance: u32,
     ) {
-        self.window = None;
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
         let ready = self.prepare(list, false);
@@ -2846,7 +2872,6 @@ impl State {
         base: i32,
         first_instance: u32,
     ) {
-        self.window = None;
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
         // Indexed rectangles are drawn by the rectangle geometry stage
