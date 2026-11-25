@@ -219,7 +219,7 @@ fn card_slot(shadow: &Arc<Shadow>) -> u16 {
 /// that refreshes them reads zeros while they are guarded, and a write guard
 /// (`watch.rs`) put on such a block since takes ours away.
 fn guard_card_blocks(shadow: &std::sync::Weak<Shadow>, at: u64, n: u64) {
-    use windows_sys::Win32::System::Memory::{PAGE_NOACCESS, VirtualProtect};
+    use windows_sys::Win32::System::Memory::{PAGE_NOACCESS, PAGE_READONLY, VirtualProtect};
     let Some(shadow) = shadow.upgrade() else {
         return;
     };
@@ -238,9 +238,21 @@ fn guard_card_blocks(shadow: &std::sync::Weak<Shadow>, at: u64, n: u64) {
             continue;
         }
         CARD_OWNER[block].store(slot, Ordering::Release);
+        let start = block * CARD_BLOCK;
         let mut old = 0;
+        // Read-only first, and the copy made the title's bytes again: the
+        // refresh that took them ran when the list was recorded, and the
+        // title may have written since (its write would be lost when the
+        // block goes back). A write meanwhile faults and waits (the block
+        // is moving). The submission's shaders have not run yet.
         // SAFETY: title memory; only its protection changes.
-        let done = unsafe { VirtualProtect((block * CARD_BLOCK) as *const _, CARD_BLOCK, PAGE_NOACCESS, &mut old) } != 0;
+        if unsafe { VirtualProtect(start as *const _, CARD_BLOCK, PAGE_READONLY, &mut old) } == 0 {
+            state.store(was, Ordering::Release);
+            continue;
+        }
+        shadow.take_back(start as u64, CARD_BLOCK as u64);
+        // SAFETY: as above.
+        let done = unsafe { VirtualProtect(start as *const _, CARD_BLOCK, PAGE_NOACCESS, &mut old) } != 0;
         if done {
             state.store(CARD_GUARDED, Ordering::Release);
             CARD_COUNTS[0].fetch_add(1, Ordering::Relaxed);
@@ -2399,6 +2411,22 @@ impl Shadow {
             return;
         }
         list.defer_gpu_write(self, address as usize, len as usize);
+    }
+
+    /// The title's bytes of `[at, at + n)` (what of it the copy holds) put
+    /// into the copy: [`Self::give_back`] the other way, when a block
+    /// becomes the card's.
+    fn take_back(&self, at: u64, n: u64) {
+        let a = at.max(self.start);
+        let b = (at + n).min(self.start + self.len);
+        if a >= b {
+            return;
+        }
+        // SAFETY: inside the copy's mapping and the title's block, which is
+        // readable now and changes no more.
+        unsafe {
+            std::ptr::copy_nonoverlapping(a as *const u8, self.data.add((a - self.start) as usize), (b - a) as usize);
+        }
     }
 
     /// The card's bytes of `[at, at + n)` (what of it the copy holds) put
