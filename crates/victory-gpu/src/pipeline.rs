@@ -263,6 +263,14 @@ pub(crate) fn builder_quarantined(this: This) -> bool {
     is_builder(this) && *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_QUARANTINE").is_some_and(|v| v == "1"))
 }
 
+/// `VICTORY_BVH_CARD=1`: what the structure builder's stages write is the
+/// card's (`shadow::card_owned_while`).
+#[cfg(windows)]
+pub(crate) fn builder_on_card(this: This) -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    is_builder(this) && *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_CARD").is_some_and(|v| v == "1"))
+}
+
 /// Whether the title's pipeline `this` is one of the structure builder's.
 #[cfg(windows)]
 pub(crate) fn is_builder(this: This) -> bool {

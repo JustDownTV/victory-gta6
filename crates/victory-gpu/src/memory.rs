@@ -349,7 +349,8 @@ pub(crate) fn ready(
     // shortcut: a copy no shader touched for that long and reached through
     // a pointer is stale for the frame that touches it again (its mark
     // brings it back from the next frame on), as a page without a copy is.
-    let all = writes && list.first_use(READ);
+    // (Writes that become the card's are not compared: no need.)
+    let all = writes && !crate::shadow::card_owned() && list.first_use(READ);
     let first_write = writes && list.first_use(WRITE);
     let first_read = all || list.first_use(READ - 2);
     for (n, shadow) in m.copies.iter().enumerate() {

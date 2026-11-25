@@ -77,6 +77,109 @@ pub(crate) struct Shadow {
     /// and the bytes from the buffer's first byte to `start` (the heap
     /// begins on a 64 KiB line; a title buffer need not).
     place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
+    /// Ranges of the copy (title addresses, sorted, apart) the card owns
+    /// ([`card_owned_while`]): what shaders wrote there stays in the copy,
+    /// and no refresh copies title memory over it.
+    owned: Mutex<Vec<(u64, u64)>>,
+}
+
+thread_local! {
+    /// While a draw of the ray-tracing structure builder is prepared, with
+    /// `VICTORY_BVH_CARD=1`: what its shaders may write is the card's.
+    static CARD_OWNED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Until the returned guard is dropped, ranges declared written on this
+/// thread ([`Shadow::gpu_writes`]) become the card's if `on`: no snapshot
+/// before the submission, no compare and no copy back after it, and from
+/// then on no refresh from title memory. The ray-tracing structure builder
+/// declares writes for every window it can reach, some 950 of 4 MiB: the
+/// snapshots and compares of them took 12.7 GB and 0.8 s a frame (0.1 fps).
+/// shortcut: the title never sees what the builder writes (sizes and
+/// counters it reads back included), and memory the title writes again
+/// after the builder owned it stays stale on the card.
+pub(crate) fn card_owned_while(on: bool) -> CardOwnedGuard {
+    CardOwnedGuard(CARD_OWNED.replace(on))
+}
+
+/// Whether writes declared on this thread now become the card's.
+pub(crate) fn card_owned() -> bool {
+    CARD_OWNED.get()
+}
+
+/// See [`card_owned_while`].
+pub(crate) struct CardOwnedGuard(bool);
+
+impl Drop for CardOwnedGuard {
+    fn drop(&mut self) {
+        CARD_OWNED.set(self.0);
+    }
+}
+
+/// `[a, b)` with the ranges of `owned` (sorted, apart) taken out.
+fn not_owned(owned: &[(u64, u64)], a: u64, b: u64) -> Vec<(u64, u64)> {
+    let mut left = Vec::new();
+    let mut at = a;
+    for &(s, e) in owned {
+        if e <= at {
+            continue;
+        }
+        if s >= b {
+            break;
+        }
+        if s > at {
+            left.push((at, s));
+        }
+        at = at.max(e);
+    }
+    if at < b {
+        left.push((at, b));
+    }
+    left
+}
+
+/// `owned` (sorted, apart) with `[a, b)` added.
+fn own(owned: &mut Vec<(u64, u64)>, a: u64, b: u64) {
+    let (mut a, mut b) = (a, b);
+    owned.retain(|&(s, e)| {
+        if e < a || s > b {
+            return true;
+        }
+        a = a.min(s);
+        b = b.max(e);
+        false
+    });
+    let at = owned.partition_point(|&(s, _)| s < a);
+    owned.insert(at, (a, b));
+}
+
+#[cfg(test)]
+mod owned_tests {
+    use super::{not_owned, own};
+
+    #[test]
+    fn owning_joins_touching_and_overlapping_ranges_in_order() {
+        let mut o = Vec::new();
+        own(&mut o, 100, 200);
+        own(&mut o, 300, 400);
+        own(&mut o, 0, 50);
+        assert_eq!(o, [(0, 50), (100, 200), (300, 400)]);
+        // Touching one, overlapping the next: one range.
+        own(&mut o, 200, 350);
+        assert_eq!(o, [(0, 50), (100, 400)]);
+        own(&mut o, 10, 20);
+        assert_eq!(o, [(0, 50), (100, 400)]);
+    }
+
+    #[test]
+    fn a_refresh_leaves_out_what_the_card_owns() {
+        let o = [(100, 200), (300, 400)];
+        assert_eq!(not_owned(&o, 0, 500), [(0, 100), (200, 300), (400, 500)]);
+        assert_eq!(not_owned(&o, 150, 350), [(200, 300)]);
+        assert_eq!(not_owned(&o, 120, 180), []);
+        assert_eq!(not_owned(&o, 400, 450), [(400, 450)]);
+        assert_eq!(not_owned(&[], 5, 9), [(5, 9)]);
+    }
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -1940,7 +2043,18 @@ impl Shadow {
     /// and keeps the copy alive until the list is reset.
     pub(crate) fn refresh(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
         let len = len.min(self.start + self.len - address);
-        list.defer_refresh(self, address as usize, len as usize);
+        let owned = self.owned.lock().unwrap_or_else(|e| e.into_inner());
+        if owned.is_empty() {
+            drop(owned);
+            list.defer_refresh(self, address as usize, len as usize);
+            return;
+        }
+        // What the card owns has its bytes there already.
+        let pieces = not_owned(&owned, address, address + len);
+        drop(owned);
+        for (a, b) in pieces {
+            list.defer_refresh(self, a as usize, (b - a) as usize);
+        }
     }
 
     fn new(buffer: ID3D12Resource, data: *mut u8, gpu: u64, start: u64, len: u64) -> Shadow {
@@ -1969,6 +2083,7 @@ impl Shadow {
             card: None,
             window: false,
             place: None,
+            owned: Mutex::default(),
         }
     }
 
@@ -2004,6 +2119,11 @@ impl Shadow {
             return;
         }
         let len = len.min(self.left(address));
+        if card_owned() {
+            let mut owned = self.owned.lock().unwrap_or_else(|e| e.into_inner());
+            own(&mut owned, address, address + len);
+            return;
+        }
         list.defer_gpu_write(self, address as usize, len as usize);
     }
 

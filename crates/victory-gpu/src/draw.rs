@@ -896,6 +896,8 @@ impl State {
             list.keep(&p.pso);
             list.keep(&p.root);
         }
+        // What the structure builder writes stays on the card, if asked.
+        let _card = crate::shadow::card_owned_while(crate::pipeline::builder_on_card(self.pipeline as This));
         for stage in &p.stages {
             let t = stage.translated();
             STORES.set(t.stores);
