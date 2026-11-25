@@ -2809,7 +2809,7 @@ impl<'a> Lower<'a> {
     /// (and drops writes) through the null view at the first slot, and its
     /// number is left for the host, for lanes that run (`guard`).
     fn memory(&mut self, lo: V, hi: V, guard: Option<V>) -> (V, V) {
-        use super::shader::{MEMORY_FAULTS, MEMORY_PAGES, SLOT_FAULTS, SLOT_MEMORY, USER_MEMORY_BASE};
+        use super::shader::{MEMORY_COPIES, MEMORY_FAULTS, MEMORY_PAGES, SLOT_FAULTS, SLOT_MEMORY, USER_MEMORY_BASE};
         let c = self.cur;
         let (i32t, res) = (self.s.t.i32, self.s.t.res_ret);
         let k = |l: &mut Self, v: u32| l.s.m.i32(v);
@@ -2839,8 +2839,10 @@ impl<'a> Lower<'a> {
         );
         let (copy, start) = (self.s.m.extract(c, entry, 0), self.s.m.extract(c, entry, 1));
         let (copy, start) = (self.as_int(copy), self.as_int(start));
-        // A page without a copy: its number, at a place by the number, or
-        // at the sink for lanes that do not run and pages that have one.
+        // A page without a copy: its number, at a place by the number. A
+        // page with one (or a lane that does not run): 1 at its copy's mark
+        // after the places, so the host knows the copy is in use (copy 0,
+        // the null view's, takes the lanes that do not run).
         let zero = k(self, 0);
         let mut missing = self.s.m.cmp(c, pred::EQ, copy, zero);
         if let Some(g) = guard {
@@ -2852,7 +2854,18 @@ impl<'a> Lower<'a> {
         let place = self.s.m.bin(c, Bin::Add, place, one);
         let k2 = k(self, 2);
         let place = self.s.m.bin(c, Bin::Shl, place, k2);
-        let place = self.s.m.select(c, missing, place, zero);
+        // Inside the marks whatever the directory holds: a root view has
+        // no bounds of its own.
+        let most = k(self, MEMORY_COPIES - 1);
+        let mark = self
+            .s
+            .op(c, "binary.i32", Attr::ReadNone, i32t, 40, &[copy, most]);
+        self.s.m.tag(mark, Tag::Clamp);
+        let marks = k(self, MEMORY_FAULTS);
+        let mark = self.s.m.bin(c, Bin::Add, mark, marks);
+        let mark = self.s.m.bin(c, Bin::Shl, mark, k2);
+        let place = self.s.m.select(c, missing, place, mark);
+        let value = self.s.m.select(c, missing, page, one);
         let faults = self.s.root_uav_handle(SLOT_FAULTS);
         let void = self.s.t.void;
         let mask = self.s.m.i8(1);
@@ -2862,7 +2875,7 @@ impl<'a> Lower<'a> {
             Attr::NoUnwind,
             void,
             140,
-            &[faults, place, iu, page, iu, iu, iu, mask, align],
+            &[faults, place, iu, value, iu, iu, iu, mask, align],
         );
         let base = self.host_word(RootType::Other(USER_MEMORY_BASE), 0, 0);
         let slot = self.s.m.bin(c, Bin::Add, base, copy);

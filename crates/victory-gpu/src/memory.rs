@@ -47,7 +47,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use victory_shader::emit::{MEMORY_FAULTS, MEMORY_PAGES};
+use victory_shader::emit::{MEMORY_COPIES, MEMORY_FAULTS, MEMORY_PAGES};
 use windows::Win32::Graphics::Direct3D12::*;
 
 use crate::descriptor::host::HostHeap;
@@ -56,7 +56,10 @@ use crate::shadow::Shadow;
 
 /// Copies that can be numbered (the run of heap slots is one longer). A
 /// listed frame of the opening cutscene names about 50 windows.
-const COPIES: u32 = 1023;
+const COPIES: u32 = MEMORY_COPIES - 1;
+/// Frames a copy no shader touched stays brought up to date for every
+/// list of shaders that only read (see [`ready`]).
+const TOUCHED_FRAMES: u64 = 8;
 /// A window of memory outside buffers (`shadow.rs`).
 const CELL: u64 = 4 << 20;
 /// A directory page.
@@ -68,6 +71,9 @@ struct Memory {
     faults: (ID3D12Resource, *mut u32, u64),
     /// Copy `n` is `copies[n - 1]`.
     copies: Vec<Arc<Shadow>>,
+    /// Per copy (as `copies`): the last frame shaders touched it (or it
+    /// was numbered), from the marks after the faults.
+    touched: Vec<u64>,
     /// Per host view heap (by address): the first slot of its run, and how
     /// many copies have their view there.
     heaps: HashMap<usize, (u32, u32)>,
@@ -106,12 +112,25 @@ impl Memory {
         tracing::info!("title memory by address: a shader reads or writes through raw addresses");
         Some(Memory {
             directory: make(u64::from(MEMORY_PAGES) * 2, "directory")?,
-            faults: make(u64::from(MEMORY_FAULTS), "faults")?,
+            faults: make(u64::from(MEMORY_FAULTS + MEMORY_COPIES), "faults")?,
             copies: Vec::new(),
+            touched: Vec::new(),
             heaps: HashMap::new(),
             frame: u64::MAX,
             refused: Default::default(),
         })
+    }
+
+    /// The index in `copies` of the copy holding the page of `address`, if
+    /// it has one.
+    fn copy_at(&self, address: u64) -> Option<usize> {
+        let page = address / PAGE;
+        if page >= u64::from(MEMORY_PAGES) - 1 {
+            return None;
+        }
+        // SAFETY: inside the directory's mapping.
+        let n = unsafe { self.directory.1.add(page as usize * 2).read_volatile() };
+        (n as usize).checked_sub(1)
     }
 
     /// Gives the page of `address` its copy, if it has none and the memory
@@ -156,6 +175,7 @@ impl Memory {
             Some(n) => n,
             None if self.copies.len() < COPIES as usize => {
                 self.copies.push(shadow.clone());
+                self.touched.push(crate::frame::current());
                 let n = self.copies.len() - 1;
                 // Every page the copy holds whole, not only the one asked
                 // for: a structure is more than 64 KiB.
@@ -223,6 +243,20 @@ impl Memory {
         for page in pages {
             self.map(u64::from(page) * PAGE);
         }
+        // The copies shaders touched since: marked by the accesses that
+        // found their page.
+        for n in 0..self.copies.len() {
+            // SAFETY: inside the faults' mapping (copies stay below
+            // MEMORY_COPIES); the GPU may be writing, a mark missed now is
+            // written again.
+            let at = unsafe { self.faults.1.add(MEMORY_FAULTS as usize + 1 + n) };
+            // SAFETY: as above.
+            if unsafe { at.read_volatile() } != 0 {
+                self.touched[n] = self.frame;
+                // SAFETY: as above.
+                unsafe { at.write_volatile(0) };
+            }
+        }
     }
 
     /// What a dispatch names: the copy around `address` and the 4 MiB
@@ -258,8 +292,10 @@ pub(crate) fn ready(
         m.take_faults();
     }
     let numbered = m.copies.len();
+    // The addresses the dispatch names, and the copies holding them.
+    let mut named = Vec::new();
     for &address in addresses {
-        m.name(address);
+        named.push(address);
     }
     // A title address in two constants (low dword, then bits 32 to 39), or
     // in one in 256-byte units. A constant that only looks like one names
@@ -269,10 +305,17 @@ pub(crate) fn ready(
             && (1..=0xFF).contains(&high)
             && c >= 0x1_0000
         {
-            m.name(u64::from(c) | u64::from(high) << 32);
+            named.push(u64::from(c) | u64::from(high) << 32);
         }
         if c >= 0x0100_0000 {
-            m.name(u64::from(c) << 8);
+            named.push(u64::from(c) << 8);
+        }
+    }
+    let mut held = Vec::new();
+    for &address in &named {
+        m.name(address);
+        for at in [address, (address & !(CELL - 1)) + CELL] {
+            held.extend(m.copy_at(at));
         }
     }
     let key = std::ptr::from_ref(heap) as usize;
@@ -296,11 +339,27 @@ pub(crate) fn ready(
     // by that list's submission, which may run after this one's.
     const READ: usize = usize::MAX - 0x6d;
     const WRITE: usize = usize::MAX - 0x6e;
-    let first_read = list.first_use(READ);
+    // A dispatch of shaders that only read brings up to date (once per
+    // list) the copies it names and those shaders touched in the last
+    // [`TOUCHED_FRAMES`] frames, not every numbered copy: with the builder
+    // on, some 950 copies of 4 MiB were read again from title memory for
+    // each of 46 lists a frame (3.2 GB of copies, 3.3 million page faults,
+    // 0.1 fps). A dispatch that stores still brings all of them up to date
+    // first: a stale copy declared written would be compared and put back.
+    // shortcut: a copy no shader touched for that long and reached through
+    // a pointer is stale for the frame that touches it again (its mark
+    // brings it back from the next frame on), as a page without a copy is.
+    let all = writes && list.first_use(READ);
     let first_write = writes && list.first_use(WRITE);
+    let first_read = all || list.first_use(READ - 2);
     for (n, shadow) in m.copies.iter().enumerate() {
         let (start, len) = shadow.span();
-        if first_read || n >= numbered {
+        let wanted = all
+            || n >= numbered
+            || held.contains(&n)
+            || frame.saturating_sub(m.touched[n]) <= TOUCHED_FRAMES;
+        // Once per list and copy.
+        if wanted && list.first_use(Arc::as_ptr(shadow) as usize | 1) {
             shadow.refresh(list, start, len);
         }
         if writes && (first_write || n >= numbered) {

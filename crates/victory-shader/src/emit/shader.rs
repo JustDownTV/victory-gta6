@@ -55,8 +55,14 @@ pub const SLOT_MEMORY: u8 = 254;
 pub const SLOT_FAULTS: u8 = 253;
 /// Entries of the [`SLOT_MEMORY`] directory: title addresses below 128 GiB.
 pub const MEMORY_PAGES: u32 = 1 << 21;
-/// Dwords of the [`SLOT_FAULTS`] buffer.
+/// Dwords of the [`SLOT_FAULTS`] buffer that take page numbers. After them,
+/// [`MEMORY_COPIES`] more: dword `n` is set to 1 by an access that found
+/// copy `n`, so the host knows which copies shaders use (the access that
+/// found its page writes there instead of the sink, at no extra cost).
 pub const MEMORY_FAULTS: u32 = 4096;
+/// Copies the [`SLOT_MEMORY`] directory can name, the null one included:
+/// numbers are clamped below it.
+pub const MEMORY_COPIES: u32 = 1024;
 /// `RootType::Other` code of a user-data dword the host computes: the view
 /// heap slot of the memory copies' views ([`SLOT_MEMORY`]).
 pub const USER_MEMORY_BASE: u32 = 0x100;
