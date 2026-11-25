@@ -170,6 +170,11 @@ pub(crate) struct Shader {
     pub threads: Option<[u32; 3]>,
     /// The wave size a compute shader requires (`WaveSize`).
     pub wave_size: Option<u32>,
+    /// Every unordered access view is globally coherent: what one thread
+    /// group writes, another reads at once, past its own cache (the
+    /// ray-tracing structure builder's groups hand tree nodes to each
+    /// other through memory; see `Lower::coherent`).
+    pub coherent: bool,
     /// Thread-group shared memory, in dwords.
     pub lds_dwords: u32,
     lds: Option<V>,
@@ -224,6 +229,7 @@ impl Shader {
             nonuniform_handles: 0,
             threads: None,
             wave_size: None,
+            coherent: false,
             lds_dwords: 0,
             lds: None,
             main,
@@ -389,6 +395,11 @@ impl Shader {
     }
 
     pub fn annotate(&mut self, block: usize, h: V, props0: u32, props1: u32) -> V {
+        // An unordered access view (bit 12) is globally coherent (bit 14)
+        // in a program that asks for it.
+        const UAV: u32 = 0x1000;
+        const GLOBALLY_COHERENT: u32 = 0x4000;
+        let props0 = if self.coherent && props0 & UAV != 0 { props0 | GLOBALLY_COHERENT } else { props0 };
         let p = [self.m.i32(props0), self.m.i32(props1)];
         let p = self.m.aggregate(self.t.props, &p);
         self.op(
@@ -579,6 +590,8 @@ impl Shader {
                 let u = self.m.undef(p);
                 let no = self.m.bool(false);
                 let no = self.m.md_value(no);
+                let coherent = self.m.bool(self.coherent);
+                let coherent = self.m.md_value(coherent);
                 let mut list = Vec::new();
                 for (n, (slot, _)) in self.root_uavs.clone().into_iter().enumerate() {
                     // Id, variable, name, space, lower bound, range size,
@@ -592,7 +605,7 @@ impl Shader {
                         Some(i32c(&mut self, u32::from(slot))),
                         Some(i32c(&mut self, 1)),
                         Some(i32c(&mut self, 11)),
-                        Some(no),
+                        Some(coherent),
                         Some(no),
                         Some(no),
                         None,

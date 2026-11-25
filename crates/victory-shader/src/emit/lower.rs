@@ -1414,6 +1414,12 @@ impl<'a> Lower<'a> {
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
             s.lds_dwords = cs.lds_bytes() / 4;
+            // The ray-tracing structure builder (its programs are the ones
+            // with a spilled user-data table): its groups hand tree nodes,
+            // boxes and counters to each other through memory, past the
+            // cache (`glc`/`dlc` on the console, globally coherent views in
+            // its HLSL), so its views are globally coherent here too.
+            s.coherent = crate::spill::is_spilled(x.native);
             // Code reading other lanes needs the console's wave size and
             // lane order; so do lane masks read as numbers, and LDS shared
             // within one wave, where the console compiler leaves out barriers.
@@ -4824,6 +4830,22 @@ impl<'a> Lower<'a> {
             let void = self.s.t.void;
             self.s.op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
         }
+        // The structure builder's atomics order its memory as the console's
+        // waits around them do (a device-wide fence before the counter that
+        // elects which group goes on, in its HLSL): a fence for the views
+        // before and after each.
+        let fenced = self.s.coherent
+            && name.contains("_atomic_")
+            && matches!(inst.fields, Fields::Buffer { .. } | Fields::Flat { .. });
+        let fence = |l: &mut Self| {
+            // UAV fence across the device, no wait for the group.
+            let mode = l.s.m.i32(2);
+            let void = l.s.t.void;
+            l.s.op(l.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+        };
+        if fenced {
+            fence(self);
+        }
         let r = match &inst.fields {
             Fields::Sop { .. } => self.sop(inst),
             Fields::Sopp { .. } if name == "s_barrier" && self.no_barrier.contains(&b) => Ok(()),
@@ -4869,6 +4891,9 @@ impl<'a> Lower<'a> {
             Fields::Flat { .. } if name.starts_with("global_") => self.flat(inst, b, i),
             Fields::Flat { .. } => Err("flat memory"),
         };
+        if fenced && r.is_ok() {
+            fence(self);
+        }
         match r {
             Ok(()) => Ok(()),
             Err(why) if effect => Err(unsupported(offset, why)),
@@ -11033,6 +11058,11 @@ impl<'a> Lower<'a> {
         // loop cut at 64 it ran 90 frames. Raise them again once shaders
         // stop reading data that is not there yet.)
         let limit = match super::loop_limit() {
+            // The structure builder's loops run as many times as its data
+            // says (copies of a whole structure, an instance per partition):
+            // cut at 4,096 they left structures half copied, which the title
+            // reads back as sizes and pointers.
+            LOOP_LIMIT if self.s.coherent => LOOP_LIMIT,
             LOOP_LIMIT if self.s.pixel => 1 << 7,
             LOOP_LIMIT if self.s.mesh.is_some() || self.s.threads.is_none() => 1 << 8,
             LOOP_LIMIT => 1 << 12,
