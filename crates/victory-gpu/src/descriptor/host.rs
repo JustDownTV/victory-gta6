@@ -58,6 +58,15 @@ pub(crate) struct HostHeap {
     /// (`victory_shader::emit::SLOT_STRIDES`): an upload buffer of
     /// `SLOT_STRIDES_COUNT` dwords, its GPU address and its mapping.
     strides: Option<(ID3D12Resource, u64, usize)>,
+    /// View heaps: the title address of the buffer or acceleration-structure
+    /// view at each title slot, for shaders that take a view's address from
+    /// a slot they compute (`victory_shader::emit::SLOT_VIEW_ADDRESSES`;
+    /// ported from DexNom/VIctory): an upload buffer and its mapping, made on
+    /// first use ([`HostHeap::address_buffer`]).
+    addresses: std::sync::OnceLock<(ID3D12Resource, usize)>,
+    /// Title slots holding an acceleration-structure view (a null resource
+    /// and a title address), which `buffers` does not hold.
+    acceleration: Mutex<std::collections::BTreeSet<u32>>,
     /// Title slots holding buffer views. Such a view gets its host slot
     /// (and its memory a host copy) only when something reads it: a draw
     /// through a table, or [`HostHeap::buffer_slots`] for shaders that pick
@@ -957,6 +966,8 @@ impl HostHeap {
             free: std::sync::atomic::AtomicU32::new(DYNAMIC),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
             strides,
+            addresses: std::sync::OnceLock::new(),
+            acceleration: Mutex::default(),
             buffers: Mutex::default(),
             changed: Mutex::default(),
             textures: Mutex::default(),
@@ -1117,6 +1128,42 @@ impl HostHeap {
     /// The table's buffer, for a list to hold.
     pub(crate) fn strides_buffer(&self) -> Option<&ID3D12Resource> {
         self.strides.as_ref().map(|s| &s.0)
+    }
+
+    /// The table of title addresses by title slot
+    /// (`victory_shader::emit::SLOT_VIEW_ADDRESSES`): the slot count, a null
+    /// entry, then one 64-bit title address per slot. Made on first use
+    /// from the views the heap holds then, under the slot lock that
+    /// [`HostHeap::note_buffer`]'s later writes take.
+    pub(crate) fn address_buffer(&self, heap: &super::Heap) -> Option<&ID3D12Resource> {
+        if let Some((buffer, _)) = self.addresses.get() {
+            return Some(buffer);
+        }
+        let _made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        if self.addresses.get().is_none() {
+            let bytes = (u64::from(self.count) + 2) * 8;
+            let (buffer, data) = host()?.upload_buffer(bytes)?;
+            crate::host::name(&buffer, || "title addresses by view heap slot".to_owned());
+            // SAFETY: the mapped upload buffer has room for the whole table.
+            unsafe {
+                std::ptr::write_bytes(data, 0, bytes as usize);
+                data.cast::<u64>().write(u64::from(self.count));
+            }
+            let buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            let acceleration = self.acceleration.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            for slot in buffers.into_iter().chain(acceleration).filter(|&s| s < self.count) {
+                let address = heap
+                    .handle(slot)
+                    .and_then(super::view)
+                    .as_ref()
+                    .and_then(guest_srv_address)
+                    .unwrap_or(0);
+                // SAFETY: inside the table: slot < count.
+                unsafe { data.cast::<u64>().add(slot as usize + 2).write(address) };
+            }
+            let _ = self.addresses.set((buffer, data as usize));
+        }
+        self.addresses.get().map(|v| &v.0)
     }
 
     /// Up to `max` title slots whose texture view is due at `frame`, each
@@ -1596,6 +1643,22 @@ impl HostHeap {
             }
         }
         let stride = view.and_then(view_stride);
+        if let Some((_, mapping)) = self.addresses.get()
+            && index < self.count
+        {
+            let address = view.and_then(guest_srv_address).unwrap_or(0);
+            // SAFETY: inside the table: index < count; shaders read it while
+            // we write (either value is one the slot had).
+            unsafe { (*mapping as *mut u64).add(index as usize + 2).write_volatile(address) };
+        }
+        {
+            let mut acceleration = self.acceleration.lock().unwrap_or_else(|e| e.into_inner());
+            if view.and_then(acceleration_location).is_some() {
+                acceleration.insert(index);
+            } else {
+                acceleration.remove(&index);
+            }
+        }
         if let Some((_, _, data)) = &self.strides
             && index < victory_shader::emit::SLOT_STRIDES_COUNT
         {
@@ -2036,6 +2099,46 @@ fn element_size(desc: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> u64 {
     } else {
         crate::resource::element(desc.Format.0 as u32).map_or(0, |(bytes, _)| bytes)
     }
+}
+
+/// The record count of a structured buffer shader resource view as the
+/// title described it (`victory_shader::emit::USER_VIEW_RECORDS`; ported
+/// from DexNom/VIctory).
+pub(crate) fn structured_srv_records(view: &View) -> Option<u32> {
+    let words = match view {
+        View::Shader(resource, Some(desc)) if *resource != 0 => desc,
+        View::Placed(false, resource, desc) if resource[0] == 1 && (desc[10] | desc[11]) != 0 => {
+            desc[..10].try_into().ok()?
+        }
+        _ => return None,
+    };
+    let desc = srv_desc(words);
+    if desc.ViewDimension != D3D12_SRV_DIMENSION_BUFFER || desc.Format != DXGI_FORMAT_UNKNOWN {
+        return None;
+    }
+    // SAFETY: a buffer SRV's union member.
+    let buffer = unsafe { desc.Anonymous.Buffer };
+    (buffer.StructureByteStride != 0).then_some(buffer.NumElements)
+}
+
+/// An acceleration-structure view: a null resource and, in the view's
+/// description, the title address of the structure.
+fn acceleration_location(view: &View) -> Option<u64> {
+    let View::Shader(0, Some(words)) = view else { return None };
+    if words[1] != D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE.0 as u32 {
+        return None;
+    }
+    let desc = srv_desc(words);
+    // SAFETY: the acceleration-structure member of the SRV union.
+    let address = unsafe { desc.Anonymous.RaytracingAccelerationStructure.Location };
+    (address != 0).then_some(address)
+}
+
+/// The title address a buffer or acceleration-structure view starts at.
+pub(crate) fn guest_srv_address(view: &View) -> Option<u64> {
+    acceleration_location(view).or_else(|| {
+        buffer_range(view).and_then(|(address, bytes)| (address != 0 && bytes != 0).then_some(address))
+    })
 }
 
 /// The title memory a buffer shader or unordered access view reads: its

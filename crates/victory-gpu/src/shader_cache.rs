@@ -74,15 +74,60 @@ fn build() -> [u8; 32] {
     if let Some(exe) = exe {
         h.update(exe);
     }
-    h.update(&victory_shader::emit::translation_fingerprint());
+    h.update(&translation_fingerprint());
     h.update(include_bytes!("shader_cache.rs"));
     *h.finalize().as_bytes()
+}
+
+/// Everything a translation depends on besides the container: the
+/// translator's sources (`victory_shader::sources`), the value of every
+/// `VICTORY_*` switch named in them, and the host facts and settings the
+/// translator runs with. (DexNom's translator has no build-time fingerprint
+/// of its own.)
+fn translation_fingerprint() -> Vec<u8> {
+    use victory_shader::emit;
+    let mut out = Vec::new();
+    let mut switches = std::collections::BTreeSet::new();
+    for source in victory_shader::sources() {
+        out.extend_from_slice(blake3::hash(source.as_bytes()).as_bytes());
+        let mut rest = *source;
+        while let Some(at) = rest.find("\"VICTORY_") {
+            let tail = &rest[at + 1..];
+            let end = tail
+                .find(|c: char| !(c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'))
+                .unwrap_or(tail.len());
+            if tail[end..].starts_with('"') {
+                switches.insert(&tail[..end]);
+            }
+            rest = &tail[end..];
+        }
+    }
+    out.push(u8::from(cfg!(feature = "diagnostics")));
+    out.push(u8::from(cfg!(debug_assertions)));
+    for name in switches {
+        out.extend_from_slice(name.as_bytes());
+        out.push(b'=');
+        if let Some(value) = std::env::var_os(name) {
+            out.extend_from_slice(value.as_encoded_bytes());
+        }
+        out.push(0);
+    }
+    for n in [
+        emit::host_max_wave(),
+        emit::view_heap_limit(),
+        emit::loop_limit(),
+        u32::from(emit::group_sync()),
+        emit::shader_opt(),
+    ] {
+        out.extend_from_slice(&n.to_le_bytes());
+    }
+    out
 }
 
 /// The offline warm-up (`victory translate --warm`): `container` is
 /// translated into the cache unless it is there already. `Ok(true)`: it
 /// was translated now. Needs [`use_shader_cache`] and the same host facts
-/// the run will have (`victory_shader::emit::translation_fingerprint`).
+/// the run will have ([`translation_fingerprint`]).
 pub fn warm(container: &[u8]) -> Result<bool, String> {
     let cache = CACHE.get().ok_or("no shader cache")?;
     let ran = AtomicBool::new(false);
@@ -113,18 +158,19 @@ fn program_hash(container: &[u8]) -> String {
 
 /// The translation of the container whose hash is `hash`.
 fn translate(hash: &str, container: &[u8]) -> Result<HostShader, String> {
-    use victory_shader::emit;
-    emit::for_program(hash, || emit::translate(container)).map_err(|e| e.to_string())
+    // (DexNom's translator has no per-program switches: the hash only
+    // names the program in the log.)
+    let _ = hash;
+    victory_shader::emit::translate(container).map_err(|e| e.to_string())
 }
 
 /// The key the translation of `container` is filed under: the build's
 /// ([`build`]), with this program's own decisions ([`program_key`]).
 fn key(hash: &str, container: &[u8]) -> [u8; 32] {
-    use victory_shader::emit;
-    // (`wave64_retried` second: it parses the container, and only a program
-    // a list names, or with `VICTORY_WAVE_DEEP_SKIPS=0` any, gets there)
-    let deep_skips_off = !emit::deep_skips_allowed(Some(hash)) && emit::wave64_retried(container);
-    program_key(&build(), deep_skips_off)
+    // (DexNom's translator has no per-program lists: every program keeps
+    // the build's key.)
+    let _ = (hash, container);
+    program_key(&build(), false)
 }
 
 /// The key of one program's entries: the build's, mixed with the
@@ -199,7 +245,7 @@ fn cached(
     (converter.translate)(container)
 }
 
-const MAGIC: &[u8; 4] = b"VSH1";
+const MAGIC: &[u8; 4] = b"VSH2";
 const STAGES: [HwStage; 8] = [
     HwStage::Ls,
     HwStage::Hs,
@@ -274,10 +320,11 @@ fn encode(s: &HostShader) -> Vec<u8> {
             word(&mut out, v);
         }
     }
-    for slots in [&s.root_cbvs, &s.root_srvs, &s.root_uavs] {
+    for slots in [&s.root_cbvs, &s.root_srvs, &s.root_uavs, &s.written_root_uavs] {
         word(&mut out, slots.len() as u32);
         out.extend(slots);
     }
+    word(&mut out, u32::from(s.writes_guest_memory));
     word(&mut out, s.root_indexed_views.len() as u32);
     for view in &s.root_indexed_views {
         for value in [
@@ -347,6 +394,12 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
     let root_cbvs = r.list()?;
     let root_srvs = r.list()?;
     let root_uavs = r.list()?;
+    let written_root_uavs = r.list()?;
+    let writes_guest_memory = match r.word()? {
+        0 => false,
+        1 => true,
+        _ => return None,
+    };
     let n = r.word()? as usize;
     let mut root_indexed_views = Vec::with_capacity(n.min(256));
     for _ in 0..n {
@@ -367,6 +420,8 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         root_cbvs,
         root_srvs,
         root_uavs,
+        written_root_uavs,
+        writes_guest_memory,
         root_indexed_views,
     })
 }
@@ -395,6 +450,8 @@ mod tests {
             root_cbvs: vec![2],
             root_srvs: vec![0, 3],
             root_uavs: vec![1],
+            written_root_uavs: vec![1],
+            writes_guest_memory: true,
             root_indexed_views: vec![RootIndexedView {
                 table_slot: 1,
                 constant_slot: 2,

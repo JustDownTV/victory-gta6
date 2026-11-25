@@ -773,9 +773,17 @@ impl State {
         dword: u32,
         memory: Option<&crate::memory::Ready>,
     ) -> u32 {
-        use victory_shader::emit::{USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS};
+        use victory_shader::emit::{
+            USER_DISPATCH_THREADS_X, USER_GROUP_BASE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
+            USER_VIEW_RECORDS,
+        };
+        // shortcut: dispatches are not split in parts here, so the first
+        // group is always 0, and 0 keeps every thread of a group active.
+        if kind == USER_GROUP_BASE || kind == USER_DISPATCH_THREADS_X {
+            return 0;
+        }
         if kind == USER_MEMORY_BASE {
-            return memory.map_or(0, |m| m.base);
+            return memory.map_or(0, |m| if dword == 0 { m.base } else { m.count });
         }
         if kind == USER_VIEW_BIAS {
             // The view begins on 16 bytes of the copy the address finds
@@ -790,17 +798,26 @@ impl State {
                 _ => 0,
             };
         }
+        let table_view = || match self.roots_ref(compute).get(usize::from(slot)) {
+            Some(&Root::Table(table)) if table != 0 => crate::descriptor::view(table + u64::from(dword) * 4),
+            _ => None,
+        };
+        if kind == USER_VIEW_RECORDS {
+            // The record count the title gave the structured view.
+            return table_view()
+                .as_ref()
+                .and_then(crate::descriptor::host::structured_srv_records)
+                .unwrap_or(0);
+        }
         if kind != USER_VIEW_ADDRESS && kind != USER_VIEW_ADDRESS + 1 {
             once!(kind, "a shader reads a host value this build does not know");
             return 0;
         }
         // The title address of the buffer view at that dword of the table.
-        let address = match self.roots_ref(compute).get(usize::from(slot)) {
-            Some(&Root::Table(table)) => crate::descriptor::view(table + u64::from(dword) * 4)
-                .and_then(|view| crate::descriptor::host::buffer_range(&view))
-                .map_or(0, |range| range.0),
-            _ => 0,
-        };
+        let address = table_view()
+            .as_ref()
+            .and_then(crate::descriptor::host::guest_srv_address)
+            .unwrap_or(0);
         if address == 0 {
             once!(slot, dword, "a shader takes the address of a buffer view that is not there: it reads 0");
         }
@@ -1056,6 +1073,33 @@ impl State {
                                 } else {
                                     l.SetGraphicsRootShaderResourceView(param, m.directory);
                                 }
+                            }
+                        }
+                        continue;
+                    }
+                    if srv && slot == victory_shader::emit::SLOT_VIEW_ADDRESSES {
+                        // Ours: the title addresses of the views by slot.
+                        let Some(heap) =
+                            (self.heaps[0] != 0).then(|| crate::descriptor::heap(self.heaps[0] as This))
+                        else {
+                            once!("a shader takes view addresses from a view heap that is not set: the draw is dropped");
+                            return false;
+                        };
+                        let Some(buffer) = heap.host().and_then(|host| host.address_buffer(heap)) else {
+                            once!("no table of view addresses: the draw is dropped");
+                            return false;
+                        };
+                        if list.first_use(buffer.as_raw() as usize) {
+                            list.keep(buffer);
+                        }
+                        // SAFETY: an open list that holds the buffer; the
+                        // parameter is a root shader resource view.
+                        unsafe {
+                            let address = buffer.GetGPUVirtualAddress();
+                            if compute {
+                                l.SetComputeRootShaderResourceView(param, address);
+                            } else {
+                                l.SetGraphicsRootShaderResourceView(param, address);
                             }
                         }
                         continue;
