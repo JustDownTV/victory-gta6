@@ -5730,6 +5730,23 @@ impl<'a> Lower<'a> {
                 self.stale.extend(inst.writes.iter().map(|w| w.1));
                 return Err("a sampler's descriptor read as data");
             }
+            // A buffer descriptor (four dwords) whose record count the code
+            // reads, using the buffer for nothing else (the shallow water
+            // simulation's `CS_MinTimestepReduce` tests it for being empty):
+            // the count of the raw view at that slot, as for a buffer the
+            // code also uses. Its address, if read, still stops the program.
+            let read = |k: u32| {
+                inst.write(Reg::S(code + k as u8)).is_some_and(|v| {
+                    self.x.p.blocks.iter().flat_map(|b| &b.insts).any(|i| i.reads.iter().any(|r| r.1 == v))
+                })
+            };
+            if count == 4 && read(2) && !read(0) && !read(1) {
+                let src = Source::Loaded { load: site, first: 0 };
+                let used = self.used_kind(&src);
+                if used.is_none_or(|u| matches!(u.kind, ResourceType::Srv) && u.dwords == 4) {
+                    return self.descriptor_words(inst, site, code, count, 0, &src, ((11, 0), None), false, used);
+                }
+            }
             // A buffer view the code only takes the address of, to walk
             // the memory behind it (a ray-tracing structure): the address
             // from the host, the other dwords have no value.
