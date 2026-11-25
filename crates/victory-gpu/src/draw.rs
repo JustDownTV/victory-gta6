@@ -220,6 +220,44 @@ fn remember_walks() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_WINDOW_REMEMBER").is_none_or(|v| v != "0"))
 }
 
+/// The step of a new window for a record at `offset` that the window open
+/// (`base`, `step`, `records`, more than one) does not hold, if the record
+/// lies on that window's grid or on a finer one: the title skips records
+/// (a window of step 32 ends, and the next record is 64 or 96 bytes past
+/// its last one, or behind its first), or interleaves records 16 bytes
+/// apart with ones 32 apart. Run t-walk2 (25/11, launcher settings): of
+/// 1,210 records a frame clamped alone, 1,140 lay off the open window,
+/// each then clamped alone before a window opened again after it.
+/// `VICTORY_WINDOW_GRID=0`: no such window (as before);
+/// `VICTORY_WINDOW_FINE=0`: the window's own step only. Pure, for testing.
+fn regrid(base: u64, step: u32, records: u32, offset: u64, stride: u32) -> Option<u32> {
+    static ON: std::sync::OnceLock<(bool, bool)> = std::sync::OnceLock::new();
+    let (grid, fine) = *ON.get_or_init(|| {
+        let off = |name| std::env::var_os(name).is_some_and(|v| v == "0");
+        (!off("VICTORY_WINDOW_GRID"), !off("VICTORY_WINDOW_FINE"))
+    });
+    regrid_with(grid, fine, base, step, records, offset, stride)
+}
+
+fn regrid_with(grid: bool, fine: bool, base: u64, step: u32, records: u32, offset: u64, stride: u32) -> Option<u32> {
+    if !grid || records < 2 || offset == base {
+        return None;
+    }
+    let apart = offset.abs_diff(base);
+    let step64 = u64::from(step);
+    if apart % step64 == 0 {
+        return Some(step);
+    }
+    if !fine {
+        return None;
+    }
+    let (mut a, mut b) = (step64, apart);
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    (a >= u64::from(stride) && a % 4 == 0).then_some(a as u32)
+}
+
 /// What one title list has set, and what its host list was last given.
 #[derive(Default)]
 pub(crate) struct State {
@@ -3083,9 +3121,15 @@ impl State {
                             && step <= 256
                             && step % 4 == 0
                             && (w.records == 1 || step == u64::from(w.step));
+                        let grid = if walks { None } else { regrid(w.base, w.step, w.records, offset, stride) };
                         if walks {
                             let fit = (args.left(arguments) / step).min(WINDOW_MOST) as u32;
                             (step as u32, (if w.records == 1 { 16 } else { w.records * 2 }).min(fit).max(1))
+                        } else if let Some(step) = grid
+                            && args.left(arguments) / u64::from(step) >= 2
+                        {
+                            let fit = (args.left(arguments) / u64::from(step)).min(WINDOW_MOST) as u32;
+                            (step, (w.records * 2).min(fit))
                         } else {
                             (stride, max)
                         }
@@ -3544,5 +3588,34 @@ pub(crate) fn depth_bounds(list: &HostList, min: f32, max: f32) {
     {
         // SAFETY: an open list on a device that supports depth bounds.
         unsafe { l1.OMSetDepthBounds(min, max) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::regrid_with;
+
+    #[test]
+    fn a_record_on_the_window_grid_keeps_its_step() {
+        // Window of 16 records 32 apart from 0x1000; the next record 96
+        // past its last one, and one behind its first.
+        assert_eq!(regrid_with(true, true, 0x1000, 32, 16, 0x1000 + 32 * 18, 12), Some(32));
+        assert_eq!(regrid_with(true, true, 0x1000, 32, 16, 0x1000 - 64, 12), Some(32));
+    }
+
+    #[test]
+    fn a_record_between_two_takes_the_finer_grid() {
+        assert_eq!(regrid_with(true, true, 0x1000, 32, 16, 0x1000 + 16 * 5, 12), Some(16));
+        assert_eq!(regrid_with(true, false, 0x1000, 32, 16, 0x1000 + 16 * 5, 12), None, "fine off");
+        // Finer than the stride, or not a multiple of 4: none.
+        assert_eq!(regrid_with(true, true, 0x1000, 32, 16, 0x1000 + 8, 12), None);
+        assert_eq!(regrid_with(true, true, 0x1000, 32, 16, 0x1000 + 34, 12), None);
+    }
+
+    #[test]
+    fn off_or_a_record_alone_gives_none() {
+        assert_eq!(regrid_with(false, true, 0x1000, 32, 16, 0x1000 + 32 * 18, 12), None);
+        assert_eq!(regrid_with(true, true, 0x1000, 32, 1, 0x1000 + 32 * 18, 12), None);
+        assert_eq!(regrid_with(true, true, 0x1000, 32, 16, 0x1000, 12), None);
     }
 }
